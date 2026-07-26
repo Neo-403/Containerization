@@ -1,0 +1,344 @@
+# ==============================================================================
+# 工作流名称: 构建目标项目 Docker 镜像
+# 描述: 这是一个通用模板，用于监控任意公开 GitHub 项目 (下称"目标项目") 的最新 Release，
+#       并在发现新版本或手动触发时，自动下载其发布包，
+#       构建多平台 Docker 镜像并推送到 Docker Hub 和 GitHub Container Registry。
+#
+# 重要说明: 目标项目与本仓库完全解耦——
+#   - 不要求本仓库 Fork 自目标项目，也不要求仓库名有任何关联
+#   - 本仓库仅作为 workflow 的载体，构建内容全部来自目标项目的 Release
+#   - 把本文件放进任何仓库、改掉 env 中的目标项目配置即可复用
+#
+# 使用方法:
+#   1. 在仓库 Settings → Secrets and variables → Actions 中配置:
+#      - Secrets:   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+#      - Variables: NAME (你的用户名，防 Fork 运行)，
+#                   可选 UPSTREAM_OWNER / UPSTREAM_REPO / IMAGE_NAME (覆盖默认值)
+#   2. 修改下方 env 中的默认值和平台资产映射表 (ASSET_PATTERNS)
+#   3. 修改 Dockerfile 步骤，编写适合目标项目的 Dockerfile
+# ==============================================================================
+name: 构建目标项目 Docker 镜像
+
+# ==============================================================================
+# 触发条件
+# ==============================================================================
+on:
+  # release:  # 当发布新的GitHub release时触发
+  #   types: [ published ]  # 当发布新的GitHub release时触发
+  workflow_dispatch:  # 手动触发
+    inputs:  # 手动触发时可填的参数
+      force_build:  # 是否强制构建并覆盖已有镜像
+        description: '是否强制构建并覆盖已有镜像'
+        type: boolean
+        required: false
+        default: false  # 默认不覆盖: 仍按镜像是否存在决定是否构建
+  schedule:  # 定时触发
+    # 每天 UTC 时间 02:00 运行 (Cron 语法)
+    - cron: '0 2 * * *'
+  # workflow_run:  # 监听其他工作流完成时触发
+  #   workflows: ["GoReleaser Workflow"]  # 指定工作流完成时触发
+  #   types: [completed]  # 当工作流完成时触发
+  push:
+    branches: [ "main", "master" ]  # 当指定分支有代码推送时触发
+  pull_request:
+    branches: [ "main", "master" ]  # 当指定分支有代码拉取请求时触发
+
+# ==============================================================================
+# 全局环境变量
+# 优先从仓库配置变量读取，未配置时使用 || 后面的默认值。
+# 换一个上游项目时，只需修改这里的默认值 (或在网页上配置变量)。
+# ==============================================================================
+env:
+  # ⭐目标项目所有者(GitHub用户名)
+  UPSTREAM_OWNER: ${{ vars.UPSTREAM_OWNER || 'ventoy' }}
+  # ⭐目标项目名称(GitHub仓库名)
+  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'PXE' }}
+  # ⭐构建的镜像名称(自定义需要构建的镜像名称)
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || 'iventoy' }}
+  # ⭐平台与发布包匹配规则映射表 (架构的唯一配置源)
+  # 格式: 每行一条  <目标平台>=<资产文件名的 grep -E 正则>
+  # - 要启用/禁用某个架构，只需增删对应行，其余步骤全自动适配
+  # - 目标平台使用 Docker 标准平台标识: linux/amd64, linux/arm64, linux/arm/v7, linux/386 ...
+  # - 匹配到的包会被自动解压到 build-context/<目标平台>/ 目录，
+  #   Dockerfile 中通过 TARGETPLATFORM 自动复制对应目录
+  # - buildx 的 platforms 参数也由此表自动生成，无需单独维护
+  # 说明: ventoy/PXE 的 x86_64 为 free 版, arm64 为 trial 版(上游资产命名所致),
+  #       下载步骤按正则自动匹配对应资产, 无需在此区分 edition。
+  ASSET_PATTERNS: |
+    # 每行一条 "平台=资产名正则表达式",# 开头的行会被脚本自动忽略
+    linux/amd64=linux-x86_64.*\.tar\.gz$
+    linux/386=linux-x86_64.*\.tar\.gz$
+    linux/arm64=linux-arm64.*\.tar\.gz$
+
+# ==============================================================================
+# 任务定义
+# ==============================================================================
+jobs:
+  # --------------------------------------------------------------------
+  # 任务 1: 检查并决定是否构建
+  # 功能: 获取上游最新版本号，并检查镜像是否已存在，决定是否需要构建。
+  # --------------------------------------------------------------------
+  check-and-build:  # 任务名称
+    runs-on: ubuntu-latest  # 运行环境
+    # 条件判断：确保只在自己仓库中运行，避免Fork仓库的无效运行
+    # 原理: 当前仓库所有者必须等于 vars.NAME (未配置该变量时回落到 || 后的默认用户名)
+    # ⭐Fork后想在自己仓库运行,下方默认用户名需改成自己的 GitHub 用户名
+    # 也可在 Settings → Secrets and variables → Actions → Variables 中配置 NAME 覆盖
+    if: ${{ github.repository_owner == (vars.NAME || 'Neo-403') }}
+
+    # 定义输出变量，用于传递给下一个任务
+    outputs:
+      # 上游最新 release tag (如 v1.2.3)
+      latest_tag: ${{ steps.get_release.outputs.tag }}
+      # 去掉前缀 v 的纯版本号 (如 1.2.3)
+      version: ${{ steps.get_release.outputs.version }}
+      # 是否需要构建
+      should_build: ${{ steps.check_image.outputs.should_build }}
+
+    steps:
+      # 步骤 1: 获取最新的 Release 版本号
+      - name: 获取最新的 Release Tag
+        id: get_release
+        run: |
+          echo "正在从 ${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }} 获取最新 release..."
+          LATEST_TAG=$(curl -sL https://api.github.com/repos/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/releases/latest | jq -r ".tag_name")
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" == "null" ]; then
+            echo "无法获取最新 release tag，可能是网络问题或仓库不存在。"
+            exit 1
+          fi
+          # 去掉 tag 前缀 v，得到纯版本号 (v1.2.3 -> 1.2.3)
+          VERSION="${LATEST_TAG#v}"
+          echo "最新的 release tag 是: $LATEST_TAG (版本号: $VERSION)"
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      # 步骤 2: 检查 Docker 镜像是否已存在(以DockerHub中为准)
+      - name: 检查 Docker 镜像是否存在
+        id: check_image
+        run: |
+          TAG="${{ steps.get_release.outputs.tag }}"
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+          # 读取手动触发时的 "强制构建" 参数 (未手动触发则为空)
+          FORCE_BUILD="${{ github.event.inputs.force_build }}"
+
+          if [ "$FORCE_BUILD" = "true" ]; then
+            # 勾选了强制构建: 忽略已有镜像, 直接覆盖 (Docker 镜像 tag 默认可覆盖)
+            echo "已选择 [强制构建并覆盖], 忽略已有镜像, 直接构建。"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            # 未勾选 (含定时触发、手动但未勾选): 检查该 tag 镜像是否已存在于 Docker Hub
+            echo "检查 Docker Hub 上 Tag 为 $TAG 的 ${{ env.IMAGE_NAME }} 镜像是否存在..."
+            if skopeo inspect docker://docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:$TAG > /dev/null 2>&1; then
+              echo "镜像已存在。跳过构建 (如需覆盖请手动触发并勾选 [强制构建并覆盖])。"
+              echo "should_build=false" >> $GITHUB_OUTPUT
+            else
+              echo "镜像不存在。将触发构建。"
+              echo "should_build=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  # --------------------------------------------------------------------
+  # 任务 2: 构建并推送镜像
+  # 功能: 下载上游各平台发布包，按架构分目录解压，多平台构建并推送。
+  # --------------------------------------------------------------------
+  build-and-push:  # 任务名称
+    needs: check-and-build  # 依赖 check-and-build
+    # 条件判断：只有当 check-and-build 确认有新的发布时，才运行本任务
+    if: needs.check-and-build.outputs.should_build == 'true'
+    runs-on: ubuntu-latest  # 运行环境
+    permissions:  # 权限设置
+      contents: read  # 读取仓库内容
+      packages: write  # 写入包
+
+    steps:
+      # 步骤 1: 下载并解压上游各平台发布包 (由 ASSET_PATTERNS 映射表驱动)
+      # 循环处理映射表中的每一行: 自动创建目录、匹配资产、下载解压，
+      # 并把启用的平台列表拼接成 buildx 所需的 platforms 参数。
+      # 如果上游只提供源码 (无预编译包)，请将此步骤替换为下载源码，
+      # 并在 Dockerfile 中使用多阶段构建自行编译。
+      - name: 下载上游发布包  # 步骤名称
+        id: download  # 步骤 ID(方便后面引用)
+        run: |
+          TAG="${{ needs.check-and-build.outputs.latest_tag }}"
+
+          # 获取该 release 的所有资产下载链接
+          ASSETS=$(curl -sL "https://api.github.com/repos/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/releases/tags/${TAG}" | jq -r '.assets[].browser_download_url')
+          echo "该 release 的资产列表:"
+          echo "$ASSETS"
+
+          # 逐行读取 ASSET_PATTERNS 映射表 (格式: 平台=正则)
+          PLATFORM_LIST=""
+          while IFS='=' read -r PLATFORM PATTERN; do
+            # 用纯 bash 参数展开去除首尾空白，避免使用 xargs 导致正则中的反斜杠(\.)被误解析
+            PLATFORM="${PLATFORM#"${PLATFORM%%[![:space:]]*}"}"
+            PLATFORM="${PLATFORM%"${PLATFORM##*[![:space:]]}"}"
+            PATTERN="${PATTERN#"${PATTERN%%[![:space:]]*}"}"
+            PATTERN="${PATTERN%"${PATTERN##*[![:space:]]}"}"
+            # 跳过空行与 # 开头的注释行 (支持行内注释)
+            case "$PLATFORM" in
+              ''|\#*) continue ;;
+            esac
+            # 平台名必须形如 linux/xxx，否则视为非法配置行跳过
+            echo "$PLATFORM" | grep -Eq '^linux/[^/]+' || { echo "跳过非法平台配置: $PLATFORM"; continue; }
+            echo "==> 处理平台: $PLATFORM (匹配规则: $PATTERN)"
+
+            # 按正则匹配该平台的发布包
+            URL=$(echo "$ASSETS" | grep -E "$PATTERN" | head -n1)
+            if [ -z "$URL" ]; then
+              echo "错误: 未匹配到平台 $PLATFORM 的发布包，请检查 ASSET_PATTERNS 配置！"
+              exit 1
+            fi
+
+            # 按平台名自动创建目录并下载解压
+            # --strip-components=1 去掉压缩包内的顶层目录
+            mkdir -p "build-context/$PLATFORM"
+            echo "下载: $URL"
+            wget -qO- "$URL" | tar -xz -C "build-context/$PLATFORM" --strip-components=1
+
+            # 拼接启用的平台列表 (逗号分隔)
+            PLATFORM_LIST="${PLATFORM_LIST:+$PLATFORM_LIST,}$PLATFORM"
+          done <<< "$ASSET_PATTERNS"
+
+          echo "启用的构建平台: $PLATFORM_LIST"
+          # 输出给后续构建步骤使用
+          echo "platforms=$PLATFORM_LIST" >> $GITHUB_OUTPUT
+
+          find build-context -maxdepth 3 -type d
+
+      # 步骤 2: ⭐动态创建 Dockerfile (在一个文件里方便修改)
+      # 利用 buildx 自动注入的 TARGETPLATFORM 参数 (如 linux/amd64、linux/arm64)，
+      # 从对应平台目录复制预编译好的程序文件，与 ASSET_PATTERNS 中的平台名一一对应。
+      # 下面的 Dockerfile 是为当前项目定制的，构建其他项目时需要修改此部分！
+      #
+      # 设计要点(已本地实测):
+      #   - data/lib 留在镜像内(不 bind 挂载), 故不存在"空目录遮蔽内置文件"的问题,
+      #     无需任何文件恢复逻辑, 启动脚本极简。
+      #   - 仅把用户配置 data/config.dat 软链到挂载的 /app/config/config.dat 实现落盘;
+      #     退出时若被原子改名写成真实文件则回拷, 保证持久化可靠。
+      #   - 启动模式按配置判定: /app/config/config.dat 存在则 -R 自动 PXE, 否则仅 WebUI。
+      - name: 创建 Dockerfile
+        run: |
+          cat > build-context/Dockerfile << 'EOF'
+          # ########################## Dockerfile (开始) ##########################
+          # 多平台: 发布包已由"下载上游发布包"步骤按 TARGETPLATFORM 解压到
+          # build-context/<平台>/, 这里直接 COPY 对应架构
+          FROM debian:stable-slim
+
+          # buildx 根据当前构建目标平台自动注入 (如 linux/amd64、linux/arm64)
+          ARG TARGETPLATFORM
+
+          # 只安装必需的 ca-certificates
+          RUN apt-get update \
+              && apt-get install -y --no-install-recommends ca-certificates \
+              && apt-get clean \
+              && rm -rf /var/lib/apt/lists/* \
+              && rm -rf /tmp/*
+
+          WORKDIR /app
+
+          # 从对应平台目录复制已下载解压好的 iVentoy 文件(下载步骤已按 TARGETPLATFORM 解压)
+          COPY ${TARGETPLATFORM}/ /app/
+
+          # ============================================
+          # 创建启动脚本,直接在Dockerfile创建
+          # ============================================
+          RUN cat > /app/entrypoint.sh << 'SCRIPT'
+          #!/bin/sh
+          cd /app
+
+          # 确保必要的目录存在
+          mkdir -p iso user log data
+
+          # 检查是否有配置文件，决定启动模式
+          if [ -f /app/data/config.dat ]; then
+              echo "[entrypoint] 检测到配置文件，使用上次配置启动"
+              ./iventoy.sh -R start &
+          else
+              echo "[entrypoint] 首次启动，使用普通模式启动"
+              ./iventoy.sh start &
+          fi
+
+          # 持续输出日志
+          tail -F /app/log/log.txt 2>/dev/null &
+
+          # 等待所有后台进程
+          wait
+          SCRIPT
+
+          # 设置执行权限(启动脚本和iventoy.sh)
+          RUN chmod +x /app/entrypoint.sh /app/iventoy.sh
+
+          # 暴露端口
+          EXPOSE 26000 16000 10809 67/udp 68/udp 69/udp
+
+          # 数据卷挂载点
+          VOLUME ["/app/iso", "/app/user", "/app/log", "/app/data"]
+
+          # 启动命令
+          CMD ["/app/entrypoint.sh"]
+          # ########################## Dockerfile (结束) ##########################
+          EOF
+
+      # 步骤 3: 设置 QEMU (用于跨架构构建，如在 amd64 机器上构建 arm64 镜像)
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # 步骤 4: 设置 Docker Buildx
+      # Docker Buildx 是 Docker 的一个 CLI 插件，用于扩展构建能力，特别是多平台构建
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 步骤 5: 登录到 Docker Hub
+      - name: 登录到 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          # 用户名和密码从仓库的 Secrets 中获取
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 步骤 6: 登录到 GitHub Container Registry
+      - name: 登录到 GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          # 使用触发工作流的用户名和自动生成的 GITHUB_TOKEN 进行登录
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 步骤 7: 提取元数据(标签)
+      - name: 提取元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # 指定要推送到的所有镜像仓库
+          images: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # 使用上游 release tag 作为镜像标签 (如 v1.2.3)
+            type=raw,value=${{ needs.check-and-build.outputs.latest_tag }}
+            # # 纯版本号标签 (如 1.2.3)
+            # type=raw,value=${{ needs.check-and-build.outputs.version }}
+            # 始终打上 latest 标签
+            type=raw,value=latest
+
+      # 步骤 8: 构建并推送 Docker 镜像
+      - name: 构建并推送 Docker 镜像
+        uses: docker/build-push-action@v5
+        with:
+          # 指定构建上下文为我们创建的 build-context 目录
+          context: build-context
+          # 指定 Dockerfile 路径
+          file: build-context/Dockerfile
+          # 推送到仓库
+          push: true
+          # 使用上一步生成的标签
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 要构建的平台，由下载步骤根据 ASSET_PATTERNS 自动生成
+          platforms: ${{ steps.download.outputs.platforms }}
+          # 使用 GitHub Actions的缓存来加速构建
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
