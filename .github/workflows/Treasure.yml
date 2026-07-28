@@ -56,14 +56,10 @@ jobs:  # 工作流作业
 
       # ========== 代码检出 ==========
       - name: 克隆项目代码
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.REPO_URL }}  # 仓库URL
-          ref: ${{ env.REPO_BRANCH || '' }}  # 分支或标签，默认为空
-          fetch-depth: 1  # 只获取最新提交，加快速度
-          # token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}  # 如果仓库是私有的，需要配置 token
-        # with:  # 参数
-        #   fetch-depth: '0'  # 获取深度，0表示获取所有提交记录
+        run: |
+          # 从 URL 提取 owner/repo
+          REPO_PATH=$(echo "${{ env.REPO_URL }}" | sed -E 's|https?://[^/]+/([^/]+/[^/.]+)(\\.git)?$|\\1|')
+          git clone --depth 1 --branch ${{ env.REPO_BRANCH || 'main' }} ${{ env.REPO_URL }} .
 
       # ========== 环境准备 ==========
       # 设置QEMU，用于构建多平台镜像
