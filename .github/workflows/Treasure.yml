@@ -1,0 +1,298 @@
+name: 构建 Docker镜像  # Actions名称，docker
+
+on:  # 定义触发工作流的事件
+  # release:  # 当发布新的GitHub release时触发
+  #   types: [ published ]  # 当发布新的GitHub release时触发
+  workflow_dispatch:  # 手动触发
+    # inputs:  # 输入的参数
+    #   tag:  # 输入的标签
+    #     description: '构建的版本号'  # 手动触发时输入的标签描述
+    #     required: true  # 必须输入
+    #     default: 'test'  # 默认标签为'test'
+  # schedule:  # 定时触发
+  #   # 每天 UTC 时间 00:00 运行 (Cron 语法)
+  #   - cron: '0 0 * * *'
+  # workflow_run:
+  #   workflows: ["GoReleaser Workflow"]  # 指定工作流完成时触发
+  #   types: [completed]  # 当工作流完成时触发
+  # push:
+  #   branches: [ "main", "master" ]  # 当指定分支有代码推送时触发
+  # pull_request:
+  #   branches: [ "main", "master" ]  # 当指定分支有代码拉取请求时触发
+
+permissions:  # 工作流权限
+  contents: read  # 工作流需要读取仓库内容的权限
+  packages: write  # 工作流需要推送包到 GitHub Container Registry 的权限
+
+# ============================================
+# 🔧 配置区域 - 在这里修改变量即可复用
+# ============================================
+env:
+  # ---------- Git 仓库配置 ----------
+  REPO_URL: https://github.com/zewei94yomi/Treasure.git
+  REPO_BRANCH: main  # 分支或 tag，留空则使用默认分支
+  PROJECT_SUBDIR: .  # 项目子目录，留空或使用 . 表示根目录
+  # ---------- 镜像配置 ----------
+  DOCKERHUB_USERNAME: 918178 # 推送的Docker Hub 用户名(若secrets中有DOCKERHUB_USERNAME则会被覆盖)
+  IMAGE_NAME: treasure  # 镜像名称
+  CUSTOM_TAG: latest  # 自定义标签，设为空则使用日期
+  EXPORT_TAR: true  # 是否导出tar包(true/false)
+  # ---------- Dockerfile 配置 ----------
+  BASE_IMAGE: nginx:alpine  # 基础镜像
+  EXPOSE_PORT: 80  # 暴露端口
+  WORKDIR: /usr/share/nginx/html  # 工作目录(复制目标路径)
+  # ---------- 构建配置 ----------
+  PLATFORMS: linux/amd64,linux/arm64/v8,linux/arm/v7  # 构建平台，多平台用逗号分隔，如：linux/amd64,linux/arm64/v8,linux/arm/v7
+  # PLATFORMS: linux/amd64,linux/386,linux/arm64/v8,linux/arm/v7,linux/arm/v6  # 全平台示例
+# ============================================
+
+# 可以有多个工作流,多个工作流依次运行
+# 一个工作流运行由一个或多个作业组成，这些作业可以顺序或并行运行
+jobs:  # 工作流作业
+  image:  # 作业名称,唯一标识
+    name: 从 Dockerfile 构建映像  # 工作流作业名称
+    runs-on: ubuntu-latest  # 在最新的Ubuntu环境中运行
+    steps:  # 工作流步骤
+
+      # ========== 代码检出 ==========
+      - name: 克隆项目代码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO_URL }}  # 仓库URL
+          ref: ${{ env.REPO_BRANCH || '' }}  # 分支或标签，默认为空
+          fetch-depth: 1  # 只获取最新提交，加快速度
+          # token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}  # 如果仓库是私有的，需要配置 token
+        # with:  # 参数
+        #   fetch-depth: '0'  # 获取深度，0表示获取所有提交记录
+
+      # ========== 环境准备 ==========
+      # 设置QEMU，用于构建多平台镜像
+      - name: 设置 QEMU  # 步骤名称
+        uses: docker/setup-qemu-action@v3  # 引用流程
+
+      # 设置Docker Buildx，用于构建和推送多平台镜像
+      - name: 设置 Docker Buildx  # 步骤名称
+        uses: docker/setup-buildx-action@v3  # 引用流程
+        with:  # 参数
+          # 使用host网络，避免网络问题
+          driver-opts: |
+            network=host
+          buildkitd-flags: --debug  # 启用调试模式
+
+      # ========== 获取版本信息 ==========
+      # 获取当前日期(格式：年月日,如 20251009)
+      - name: 获取当前日期
+        id: get-date
+        run: echo "date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: 获取 Git 信息
+        id: git-info
+        run: |
+          # 获取短 SHA
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          # 获取当前分支名
+          echo "branch=$(git rev-parse --abbrev-ref HEAD)" >> $GITHUB_OUTPUT
+
+      # ========== 处理变量 ==========
+      # 处理用户名优先级：secrets > env
+      - name: 处理用户名
+        id: set-username
+        run: |
+          # 优先使用secrets中的DOCKERHUB_USERNAME
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            echo "DOCKERHUB_USERNAME_FINAL=${{ secrets.DOCKERHUB_USERNAME }}" >> $GITHUB_ENV
+            echo "✅ 使用 secrets.DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}"
+          else
+            echo "DOCKERHUB_USERNAME_FINAL=${{ env.DOCKERHUB_USERNAME }}" >> $GITHUB_ENV
+            echo "✅ 使用 env.DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}"
+          fi
+
+      # 获取镜像标签名称
+      - name: 获取 Image Tag  # 步骤名称
+        id: set-tag
+        run: |
+          # 优先级：手动输入 > env.CUSTOM_TAG > 日期
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+            echo "📌 使用手动输入标签: ${TAG}"
+          elif [ -n "${{ env.CUSTOM_TAG }}" ] && [ "${{ env.CUSTOM_TAG }}" != "latest" ]; then
+            TAG="${{ env.CUSTOM_TAG }}"
+            echo "📌 使用自定义标签: ${TAG}"
+          else
+            TAG="${{ steps.get-date.outputs.date }}"
+            echo "📌 使用日期标签: ${TAG}"
+          fi
+          echo "TAG_NAME=${TAG}" >> $GITHUB_ENV
+          echo "tag_name=${TAG}" >> $GITHUB_OUTPUT
+
+      # ========== 登录镜像仓库 ==========
+      # 登录到 Docker Hub
+      - name: 登录 DockerHub  # 步骤名称
+        uses: docker/login-action@v3  # 引用流程
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME_FINAL }}  # Docker Hub 用户名(优先使用secrets)
+          password: ${{ secrets.DOCKERHUB_TOKEN }}  # Docker Hub Token(需在secrets中配置)
+        continue-on-error: false  # 登录失败时抛出错误
+
+      # 登录到 GitHub Container Registry
+      - name: 登录 GitHub Container Registry  # 步骤名称
+        uses: docker/login-action@v3  # 引用流程
+        with:
+          registry: ghcr.io  # GitHub Container Registry 地址
+          username: ${{ github.actor }}  # GitHub 用户名(自动获取当前用户)
+          password: ${{ secrets.GITHUB_TOKEN }}  # GitHub Token(无需配置,由 GitHub 提供)
+        continue-on-error: false  # 登录失败时抛出错误
+
+      # ========== 生成镜像标签 ==========
+      # 生成镜像标签
+      - name: 生成镜像标签
+        id: meta  # 步骤 ID,用于后续引用
+        uses: docker/metadata-action@v5
+        with:
+          # 同时指定Docker Hub和GHCR的镜像名称
+          images: |
+            ${{ env.DOCKERHUB_USERNAME_FINAL }}/${{ env.IMAGE_NAME }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          # 默认的 latest 标签行为，可由下面的 tags 规则精确控制
+          flavor: |
+            latest=false
+          # 标签规则，根据事件类型和输入参数生成标签
+          tags: |
+            type=raw,value=${{ env.TAG_NAME }}
+            type=raw,value=${{ steps.git-info.outputs.sha_short }}
+            type=raw,value=${{ steps.git-info.outputs.branch }},enable=${{ github.ref == format('refs/heads/{0}', steps.git-info.outputs.branch) }}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
+
+      # ========== 创建 Dockerfile ==========
+      - name: 创建 Dockerfile
+        run: |
+          # 确定项目路径
+          if [ -n "${{ env.PROJECT_SUBDIR }}" ] && [ "${{ env.PROJECT_SUBDIR }}" != "." ]; then
+            PROJECT_PATH="${{ env.PROJECT_SUBDIR }}"
+          else
+            PROJECT_PATH="."
+          fi
+
+          cat > Dockerfile << 'EOF'
+          # 使用指定的基础镜像
+          FROM ${{ env.BASE_IMAGE }}
+
+          # 设置工作目录
+          WORKDIR ${{ env.WORKDIR }}
+
+          # 复制项目文件
+          COPY ${PROJECT_PATH} ${{ env.WORKDIR }}
+
+          # 创建缓存目录并设置正确权限
+          RUN if command -v nginx >/dev/null 2>&1; then \
+                mkdir -p /var/cache/nginx && \
+                chown -R nginx:nginx /var/cache/nginx 2>/dev/null || true && \
+                chown -R nginx:nginx /var/log/nginx 2>/dev/null || true && \
+                chown -R nginx:nginx /etc/nginx/conf.d 2>/dev/null || true && \
+                touch /var/run/nginx.pid 2>/dev/null && \
+                chown nginx:nginx /var/run/nginx.pid 2>/dev/null || true; \
+              fi
+
+          # 暴露端口
+          EXPOSE ${{ env.EXPOSE_PORT }}
+
+          # 健康检查（可选）
+          HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+            CMD wget --quiet --tries=1 --spider http://localhost:${{ env.EXPOSE_PORT }} || exit 1
+
+          # 设置用户（如果基础镜像支持）
+          USER ${{ contains(env.BASE_IMAGE, 'nginx') && 'nginx' || 'root' }}
+          EOF
+
+          # 替换变量
+          sed -i "s|\${PROJECT_PATH}|${PROJECT_PATH}|g" Dockerfile
+          sed -i "s|\${WORKDIR}|${{ env.WORKDIR }}|g" Dockerfile
+          sed -i "s|\${BASE_IMAGE}|${{ env.BASE_IMAGE }}|g" Dockerfile
+          sed -i "s|\${EXPOSE_PORT}|${{ env.EXPOSE_PORT }}|g" Dockerfile
+
+          echo "✅ Dockerfile 创建完成："
+          cat Dockerfile
+
+      # ========== 构建并推送镜像 ==========
+      # 构建并推送镜像(可同时推送多个镜像,多个镜像平台)
+      - name: 编译并推送 ${{ env.IMAGE_NAME }}镜像  # 步骤名称
+        uses: docker/build-push-action@v5  # 引用流程
+        with:  # 参数
+          context: .  # 构建上下文
+          file: ./Dockerfile  # 指定的Dockerfile
+          platforms: ${{ env.PLATFORMS }}  # 构建的平台
+          push: true  # 推送到仓库
+          # load: true  # 加载到本地(多构建平台不支持;若其它也需调用镜像则必须加载,如打包导出)
+          # 注意 | 后注释会有问题故放在这
+          # 传递构建参数(覆盖 ARG ${{ github.event.repository.name }}_VERSION=3.5.0 配置参数)
+          # build-args: |
+          #   ${{ github.event.repository.name }}_VERSION=${{ env.TAG_NAME }}
+          # 注意 | 后注释会有问题故放在这
+          # 推送的镜像标签(版本标签+latest)
+          # tags: |  # 使用手动指定标签
+          #   ${{ env.TAG }}
+          #   ${{ env.TAG_LATEST }}
+          tags: ${{ steps.meta.outputs.tags }}  # 使用metadata-action生成的标签
+          labels: ${{ steps.meta.outputs.labels }}  # 使用metadata-action生成的标签
+          cache-from: type=gha  # 使用GitHub Action缓存
+          cache-to: type=gha,mode=max  # 使用GitHub Action缓存
+
+      # ========== 导出 tar 包 ==========
+      # 镜像打包为tar包
+      - name: 镜像打包为tar包  # 步骤名称
+        if: env.EXPORT_TAR == 'true'
+        # 注意 | 后注释会有问题故放在这
+        # 运行的具体指令,每行指令依次运行
+        run: |
+          # 获取第一个平台镜像
+          FIRST_PLATFORM=$(echo "${{ env.PLATFORMS }}" | cut -d',' -f1)
+          docker pull --platform ${FIRST_PLATFORM} ${{ env.DOCKERHUB_USERNAME_FINAL }}/${{ env.IMAGE_NAME }}:${{ env.TAG_NAME }}
+          docker save -o ${{ env.IMAGE_NAME }}.tar ${{ env.DOCKERHUB_USERNAME_FINAL }}/${{ env.IMAGE_NAME }}:${{ env.TAG_NAME }}
+          ls -lh ${{ env.IMAGE_NAME }}.tar
+          echo "✅ tar 包创建完成"
+
+      # 将构建好的镜像导出为tar包
+      - name: Archive 导出内部文件  # 步骤名称
+        if: env.EXPORT_TAR == 'true'
+        uses: actions/upload-artifact@v4  # 引用流程
+        with:  # 参数
+          name: ${{ env.IMAGE_NAME }}.tar  # 导出的文件名称
+          path: ${{ env.IMAGE_NAME }}.tar  # 导出的文件路径
+          retention-days: 1  # 保留 1 天
+
+      # ========== 清理缓存 ==========
+      - name: 清理 Docker 缓存
+        if: always()
+        run: |
+          docker builder prune -f
+          docker system prune -f --volumes
+
+      # ========== 输出构建信息 ==========
+      # 输出构建信息
+      - name: 输出构建信息
+        run: |
+          echo "=========================================="
+          echo "✅ 镜像构建并推送成功！"
+          echo "=========================================="
+          echo "📦 项目: ${{ env.REPO_URL }}"
+          echo "🌿 分支: ${{ env.REPO_BRANCH || 'default' }}"
+          echo "📂 子目录: ${{ env.PROJECT_SUBDIR }}"
+          echo "🏷️  标签: ${{ env.TAG_NAME }}"
+          echo "🔢 SHA: ${{ steps.git-info.outputs.sha_short }}"
+          echo "🖥️  平台: ${{ env.PLATFORMS }}"
+          echo ""
+          echo "🐳 Docker Hub:"
+          echo "   ${{ env.DOCKERHUB_USERNAME_FINAL }}/${{ env.IMAGE_NAME }}:${{ env.TAG_NAME }}"
+          echo "   ${{ env.DOCKERHUB_USERNAME_FINAL }}/${{ env.IMAGE_NAME }}:latest"
+          echo ""
+          echo "🐙 GitHub Container Registry:"
+          echo "   ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.TAG_NAME }}"
+          echo "   ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
+          if [ "${{ env.EXPORT_TAR }}" = "true" ]; then
+            echo ""
+            echo "📦 tar 包已导出:"
+            echo "   ${{ env.IMAGE_NAME }}-${{ env.TAG_NAME }}"
+            echo "   ⏱️  保留 1 天"
+          fi
+          echo "=========================================="
