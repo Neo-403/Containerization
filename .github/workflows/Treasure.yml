@@ -1,4 +1,4 @@
-name: 构建 Docker镜像  # Actions名称，docker
+name: 构建 Treasure(惊魂寻宝鸭 · 搜打撤)_Docker镜像  # Actions名称，docker
 
 on:  # 定义触发工作流的事件
   # release:  # 当发布新的GitHub release时触发
