@@ -38,10 +38,10 @@ on:
   # workflow_run:  # 监听其他工作流完成时触发
   #   workflows: ["GoReleaser Workflow"]  # 指定工作流完成时触发
   #   types: [completed]  # 当工作流完成时触发
-  push:
-    branches: [ "main", "master" ]  # 当指定分支有代码推送时触发
-  pull_request:
-    branches: [ "main", "master" ]  # 当指定分支有代码拉取请求时触发
+  # push:
+  #   branches: [ "main", "master" ]  # 当指定分支有代码推送时触发
+  # pull_request:
+  #   branches: [ "main", "master" ]  # 当指定分支有代码拉取请求时触发
 
 # ==============================================================================
 # 全局环境变量
