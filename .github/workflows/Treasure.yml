@@ -29,7 +29,7 @@ permissions:  # 工作流权限
 # ============================================
 env:
   # ---------- Git 仓库配置 ----------
-  REPO_URL: https://github.com/zewei94yomi/Treasure.git
+  REPO_URL: https://github.com/zewei94yomi/Treasure  # 不要带有.git后缀
   REPO_BRANCH: main  # 分支或 tag，留空则使用默认分支
   PROJECT_SUBDIR: .  # 项目子目录，留空或使用 . 表示根目录
   # ---------- 镜像配置 ----------
