@@ -27,9 +27,11 @@
 #                             否则需运行时 -v 挂载 /app/dist)
 #        * include_server    是否包含联机服务器 @noname/server
 #        以上三者组合出一种镜像(无效组合如"仅静态"会被忽略); 映射为 5 种命名变体:
-#          web+static+server -> 标准 noname        ; web+server(无static) -> noname:core
-#          web+static(无server) -> noname:web      ; web(无static/server)  -> noname:web_core
-#          server(无web)      -> noname:server
+#          web+static+server -> 标准 noname            (noname:latest + noname:vTag)
+#          web+server(无static) -> noname:core         (noname:core-latest + noname:core-vTag)
+#          web+static(无server) -> noname:web          (noname:web-latest + noname:web-vTag)
+#          web(无static/server)  -> noname:web_core    (noname:web_core-latest + noname:web_core-vTag)
+#          server(无web)      -> noname:server         (noname:server-latest + noname:server-vTag)
 #        * force_build=true -> 忽略存在性检查, 强制覆盖
 #
 # 多平台说明:
@@ -135,14 +137,15 @@ jobs:
           EVENT="${{ github.event_name }}"
 
           # 各变体定义: 名称|BUILD_SERVER|BUILD_FRONTEND|BUILD_STATIC|标签后缀|可变标签
-          #   - 标签后缀为空 -> 标准镜像(用 latest + 版本tag)
-          #   - 可变标签: 不带版本的后缀标签(如 core/web/server), 标准镜像用 latest
+          #   - 标准镜像(full): 可变标签=latest, 版本标签=vTag (noname:latest + noname:vTag)
+          #   - 其余变体: 可变标签=<后缀>-latest, 版本标签=<后缀>-vTag
+          #       (如 noname:core-latest + noname:core-vTag)
           VARIANTS=(
             "full|true|true|true||latest"
-            "core|true|true|false|core|core"
-            "web|false|true|true|web|web"
-            "web_core|false|true|false|web_core|web_core"
-            "server|true|false|false|server|server"
+            "core|true|true|false|core|core-latest"
+            "web|false|true|true|web|web-latest"
+            "web_core|false|true|false|web_core|web_core-latest"
+            "server|true|false|false|server|server-latest"
           )
 
           # ---- 安装 skopeo 用于存在性检查 ----
@@ -579,13 +582,19 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # 步骤 9: 计算本变体的镜像标签
-      #   标准镜像(full)    : latest + 版本tag(如 v1.2.3)
-      #   其余变体          : 后缀标签(如 core/web/web_core/server) + 后缀-版本tag(如 core-v1.2.3)
+      #   标准镜像(full)    : noname:latest + noname:v1.2.3
+      #   其余变体          : noname:<类型>-latest + noname:<类型>-v1.2.3
+      #                       如 core -> noname:core-latest + noname:core-v1.2.3
       - name: 计算镜像标签
         id: tags
         run: |
-          DH="${{ toLower(secrets.DOCKERHUB_USERNAME) }}/${{ env.IMAGE_NAME }}"
-          GH="ghcr.io/${{ toLower(github.repository_owner) }}/${{ env.IMAGE_NAME }}"
+          # GHCR/Docker Hub 命名空间必须全小写(bash ${var,,} 转小写, GitHub 表达式无 toLower)
+          DH_OWNER="${{ secrets.DOCKERHUB_USERNAME }}"
+          GH_OWNER="${{ github.repository_owner }}"
+          DH_OWNER="${DH_OWNER,,}"
+          GH_OWNER="${GH_OWNER,,}"
+          DH="${DH_OWNER}/${{ env.IMAGE_NAME }}"
+          GH="ghcr.io/${GH_OWNER}/${{ env.IMAGE_NAME }}"
           VT="${{ matrix.version_tag }}"
           MT="${{ matrix.mutable_tag }}"
           {
