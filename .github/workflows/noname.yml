@@ -108,6 +108,7 @@ jobs:
   # 任务 1: 获取版本 + 规划镜像变体矩阵 + 存在性检查
   # --------------------------------------------------------------------
   check:
+  - name: 获取版本 + 规划镜像变体矩阵 + 存在性检查
     runs-on: ubuntu-latest
     # 确保只在自己仓库中运行, 避免 Fork 仓库的无效运行
     if: ${{ github.repository_owner == (vars.NAME || 'Neo-403') }}
@@ -116,6 +117,8 @@ jobs:
       latest_tag: ${{ steps.get_release.outputs.tag }}
       version: ${{ steps.get_release.outputs.version }}
       matrix: ${{ steps.plan.outputs.matrix }}
+      # 是否有需要构建的变体(build 任务据此直接跳过, 避免空矩阵仍触发登录/下载等步骤)
+      build_needed: ${{ steps.plan.outputs.build_needed }}
 
     steps:
       - name: 获取最新的 Release Tag
@@ -224,8 +227,10 @@ jobs:
           if [ -z "$MATRIX_ENTRIES" ]; then
             echo "没有需要构建的变体, 输出空矩阵。"
             echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+            echo "build_needed=false" >> $GITHUB_OUTPUT
           else
             echo "matrix={\"include\":[$MATRIX_ENTRIES]}" >> $GITHUB_OUTPUT
+            echo "build_needed=true" >> $GITHUB_OUTPUT
             echo "===== 待构建矩阵: ====="
             echo "$MATRIX_ENTRIES" | jq .
           fi
@@ -234,8 +239,9 @@ jobs:
   # 任务 2: 下载源码 + 动态生成构建文件 + 顺序多平台构建并推送(含静态则清理本地)
   # --------------------------------------------------------------------
   build:
+  - name: 下载源码 + 动态生成构建文件 + 顺序多平台构建并推送
     needs: check
-    if: needs.check.result == 'success'
+    if: needs.check.result == 'success' && needs.check.outputs.build_needed == 'true'
     runs-on: ubuntu-latest
     # 顺序构建: 在同一 runner 上逐个变体构建->推送->(含静态则清理本地)->下一个,
     # 避免多个大镜像同时驻留本地磁盘; 循环内对单变体失败做隔离, 不影响其余变体。
