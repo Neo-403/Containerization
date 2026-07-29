@@ -13,7 +13,7 @@
 #        - 用 skopeo 检查各变体镜像是否已在 Docker Hub 存在; 存在则跳过, 除非手动勾选强制构建
 #   2. build 任务 (矩阵, 仅在需要构建的变体上执行):
 #        - 下载上游 Release 的 "Source code" 源码包 (GitHub 自动生成的 tar.gz 归档)
-#        - 在构建上下文内动态生成所需的 Dockerfile / .dockerignore / serve.cjs
+#        - 在构建上下文内动态生成所需的 Dockerfile / .dockerignore / Serve_ZWZW.cjs
 #          (全部由本工作流内嵌 heredoc 写出, 不依赖本仓库或 upstream 自带的文件,
 #           因此 upstream 更新只影响源码内容, 构建/启动逻辑独立可维护)
 #        - 用 docker buildx 从源码原生构建多平台镜像并推送到
@@ -87,7 +87,7 @@ env:
   IMAGE_NAME: 'noname'
   # ⭐多平台列表: buildx 从源码原生构建, 非本机架构用 QEMU 模拟。
   #   要增删平台直接改这一行 (如 'linux/amd64,linux/arm64,linux/arm/v7')。
-  PLATFORMS: linux/amd64,linux/arm64'
+  PLATFORMS: linux/amd64,linux/arm64
   # ⭐构建开关: 不再在全局写死, 而是由下方矩阵(check 任务生成的 matrix)按变体注入:
   #   BUILD_SERVER  是否内置联机服务器 @noname/server
   #   BUILD_FRONTEND 是否内置前端静态服务 @noname/fs
@@ -280,11 +280,11 @@ jobs:
           .DS_Store
           EOF
 
-      # 步骤 3: 生成 serve.cjs (统一启动器: 按环境变量启用前端/联机服务)
-      - name: 生成 serve.cjs
+      # 步骤 3: 生成 Serve_ZWZW.cjs (统一启动器: 按环境变量启用前端/联机服务)
+      - name: 生成 Serve_ZWZW.cjs
         run: |
-          cat > build-context/serve.cjs << 'EOF'
-          // serve.cjs
+          cat > build-context/Serve_ZWZW.cjs << 'EOF'
+          // Serve_ZWZW.cjs
           // 统一启动器: 通过环境变量决定启用哪些服务(默认都启用), 便于在多个镜像间复用。
           //   ENABLE_FRONTEND=true/false -> fs 静态服务(绑127.0.0.1) + 内部 TCP 转发(0.0.0.0)
           //   ENABLE_SERVER=true/false   -> ws 联机服务器(绑全部网卡)
@@ -536,13 +536,13 @@ jobs:
           USER nodejs
           WORKDIR /app
 
-          # 复制各服务产物(未构建的目录为空, 由 serve.cjs 在运行时按需跳过)
+          # 复制各服务产物(未构建的目录为空, 由 Serve_ZWZW.cjs 在运行时按需跳过)
           COPY --from=builder --chown=nodejs:nodejs /deploy/fs ./fs
           COPY --from=builder --chown=nodejs:nodejs /deploy/server ./server
           # 静态资源: 若 BUILD_STATIC=true 则内置; 否则为空目录, 由运行时 -v 挂载覆盖
           COPY --from=builder --chown=nodejs:nodejs /app/dist ./dist
           # 统一启动文件(纯 Node 标准库, 不修改任何 dist 产物)
-          COPY serve.cjs /app/serve.cjs
+          COPY Serve_ZWZW.cjs /app/Serve_ZWZW.cjs
 
           # 端口: 80=前端(静态, 0.0.0.0 经转发暴露) 8080=联机(ws)
           EXPOSE 80 8080
@@ -552,7 +552,7 @@ jobs:
           #   APP_PORT(8089) PUBLIC_PORT(80) DIRNAME(/app/dist) SERVER_PORT(8080) DEBUG(true 开 fastify 日志)
           # 静态资源挂载示例(未 BUILD_STATIC 时必需):
           #   -v /path/to/dist:/app/dist
-          CMD ["node", "/app/serve.cjs"]
+          CMD ["node", "/app/Serve_ZWZW.cjs"]
           EOF
 
       # 步骤 5: 设置 QEMU (用于跨架构构建, 如在 amd64 机器上构建 arm64 镜像)
