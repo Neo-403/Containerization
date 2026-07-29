@@ -25,12 +25,13 @@
 #
 # 触发方式:
 #   - schedule 定时: 每天 UTC 02:00, 自动构建全部 5 种镜像变体
-#   - workflow_dispatch 手动(3 个组件开关自由搭配):
+#   - workflow_dispatch 手动:
+#        * build_all         勾选则忽略下方组件开关, 一次性构建全部 5 种镜像变体
 #        * include_web       是否包含 Web 前端服务 @noname/fs
 #        * include_web_static 是否包含 Web 静态文件(仅当 include_web 时生效;
 #                             否则需运行时 -v 挂载 /app/dist)
 #        * include_server    是否包含联机服务器 @noname/server
-#        以上三者组合出一种镜像(无效组合如"仅静态"会被忽略); 映射为 5 种命名变体:
+#        未勾选 build_all 时, 以上三者组合出一种镜像(无效组合如"仅静态"会被忽略); 映射为 5 种命名变体:
 #          web+static+server -> 标准 noname            (noname:latest + noname:vTag)
 #          web+server(无static) -> noname:core         (noname:core-latest + noname:core-vTag)
 #          web+static(无server) -> noname:web          (noname:web-latest + noname:web-vTag)
@@ -62,6 +63,11 @@ on:
         type: boolean
         required: false
         default: false  # 默认不覆盖: 仍按镜像是否存在决定是否构建
+      build_all:  # 是否忽略组件开关, 直接构建全部 5 种变体
+        description: '构建全部变体(忽略下方选项)'
+        type: boolean
+        required: false
+        default: false  # 默认不勾选: 按下方 3 个组件开关组合出单一变体
       include_web:  # 是否包含 Web 前端服务
         description: '包含 Web 前端服务 @noname/fs'
         type: boolean
@@ -197,10 +203,20 @@ jobs:
               add_variant "$n" "$bs" "$bf" "$bst" "$su" "$mu"
             done
           else
-            # 手动: 由 3 个组件开关自由搭配出一种组合 -> 映射为某命名变体
-            WEB="${{ github.event.inputs.include_web }}"
-            STATIC="${{ github.event.inputs.include_web_static }}"
-            SERVER="${{ github.event.inputs.include_server }}"
+            # 手动: 根据 build_all / 3 个组件开关决定构建范围
+            BUILD_ALL="${{ github.event.inputs.build_all }}"
+            if [ "$BUILD_ALL" = "true" ]; then
+              # 勾选【全部构建】: 忽略组件开关, 构建全部 5 种变体
+              echo "手动触发 + 勾选【全部构建】 -> 构建全部 5 种变体"
+              for v in "${VARIANTS[@]}"; do
+                IFS='|' read -r n bs bf bst su mu <<< "$v"
+                add_variant "$n" "$bs" "$bf" "$bst" "$su" "$mu"
+              done
+            else
+              # 未勾选: 由 3 个组件开关自由搭配出一种组合 -> 映射为某命名变体
+              WEB="${{ github.event.inputs.include_web }}"
+              STATIC="${{ github.event.inputs.include_web_static }}"
+              SERVER="${{ github.event.inputs.include_server }}"
 
             # 静态文件依赖 Web 前端, 否则无意义(UI 无法禁用此项, 这里做无效处理)
             if [ "$WEB" != "true" ] && [ "$STATIC" = "true" ]; then
@@ -222,6 +238,7 @@ jobs:
             elif [ "$WEB" != "true" ] && [ "$SERVER" = "true" ]; then
               add_variant server true false false server server
             fi
+          fi
           fi
 
           if [ -z "$MATRIX_ENTRIES" ]; then
