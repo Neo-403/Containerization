@@ -21,10 +21,17 @@
 #
 # 触发方式:
 #   - schedule 定时: 每天 UTC 02:00, 自动构建全部 5 种镜像变体
-#   - workflow_dispatch 手动:
-#        * build_all=true (默认) -> 构建全部变体
-#        * build_all=false + 勾选具体变体 -> 仅构建所选变体
-#        * force_build=true -> 忽略存在性检查, 全部强制覆盖
+#   - workflow_dispatch 手动(自由搭配组件开关):
+#        * include_web       是否包含 Web 前端服务 @noname/fs
+#        * include_web_static 是否包含 Web 静态文件(仅当 include_web 时生效;
+#                             否则需运行时 -v 挂载 /app/dist)
+#        * include_server    是否包含联机服务器 @noname/server
+#        以上三者组合出一种镜像(无效组合如"仅静态"会被忽略); 映射为 5 种命名变体:
+#          web+static+server -> 标准 noname        ; web+server(无static) -> noname:core
+#          web+static(无server) -> noname:web      ; web(无static/server)  -> noname:web_core
+#          server(无web)      -> noname:server
+#        * build_all=true  -> 忽略组件开关, 直接构建全部 5 种变体
+#        * force_build=true -> 忽略存在性检查, 强制覆盖
 #
 # 多平台说明:
 #   - 基础镜像 node:24-alpine 自带 amd64/arm64/arm/v7 等多架构支持
@@ -50,36 +57,26 @@ on:
         type: boolean
         required: false
         default: false  # 默认不覆盖: 仍按镜像是否存在决定是否构建
-      build_all:  # 是否构建全部镜像变体
-        description: '构建全部镜像变体(full/core/web/web_core/server)'
+      build_all:  # 是否构建全部 5 种变体(忽略下方组件开关)
+        description: '构建全部 5 种变体(full/core/web/web_core/server), 忽略下方组件开关'
+        type: boolean
+        required: false
+        default: false
+      include_web:  # 是否包含 Web 前端服务
+        description: '包含 Web 前端服务 @noname/fs'
         type: boolean
         required: false
         default: true
-      build_full:  # 全量镜像 noname
-        description: '全量镜像 noname (前端+联机+静态, 开箱即用)'
+      include_web_static:  # 是否包含 Web 静态文件(仅当 include_web 时生效)
+        description: '包含 Web 静态文件(依赖[包含Web]; 若未勾选前端则此项无效并自动忽略, 运行时需 -v 挂载 /app/dist)'
         type: boolean
         required: false
-        default: false
-      build_core:  # 核心镜像 noname:core
-        description: '核心镜像 noname:core (前端+联机, 不内置静态)'
+        default: true
+      include_server:  # 是否包含联机服务器
+        description: '包含联机服务器 @noname/server'
         type: boolean
         required: false
-        default: false
-      build_web:  # web 镜像 noname:web
-        description: 'web 镜像 noname:web (仅前端服务+静态)'
-        type: boolean
-        required: false
-        default: false
-      build_web_core:  # web 核心镜像 noname:web_core
-        description: 'web 核心镜像 noname:web_core (仅前端服务)'
-        type: boolean
-        required: false
-        default: false
-      build_server:  # server 镜像 noname:server
-        description: 'server 镜像 noname:server (仅联机服务器)'
-        type: boolean
-        required: false
-        default: false
+        default: true
   schedule:  # 定时触发
     # 每天 UTC 时间 02:00 运行 (Cron 语法) -> 构建全部变体
     - cron: '0 2 * * *'
@@ -154,62 +151,28 @@ jobs:
             "server|true|false|false|server|server"
           )
 
-          # ---- 决定启用哪些变体 ----
-          if [ "$EVENT" = "schedule" ] || [ "${{ github.event.inputs.build_all }}" = "true" ]; then
-            echo "触发方式=$EVENT / build_all=true -> 构建全部变体"
-            ENABLED="full core web web_core server"
-          else
-            ENABLED=""
-            [ "${{ github.event.inputs.build_full }}" = "true" ]     && ENABLED="$ENABLED full"
-            [ "${{ github.event.inputs.build_core }}" = "true" ]     && ENABLED="$ENABLED core"
-            [ "${{ github.event.inputs.build_web }}" = "true" ]      && ENABLED="$ENABLED web"
-            [ "${{ github.event.inputs.build_web_core }}" = "true" ] && ENABLED="$ENABLED web_core"
-            [ "${{ github.event.inputs.build_server }}" = "true" ]   && ENABLED="$ENABLED server"
-            echo "手动选择变体: ${ENABLED:-<无, 将不构建任何变体>}"
-          fi
-
           # ---- 安装 skopeo 用于存在性检查 ----
           sudo apt-get update
           sudo apt-get install -y skopeo
 
           MATRIX_ENTRIES=""
-          for v in "${VARIANTS[@]}"; do
-            VNAME="${v%%|*}"
-            REST="${v#*|}"
-            BUILD_SERVER="${REST%%|*}"
-            REST="${REST#*|}"
-            BUILD_FRONTEND="${REST%%|*}"
-            REST="${REST#*|}"
-            BUILD_STATIC="${REST%%|*}"
-            REST="${REST#*|}"
-            SUFFIX="${REST%%|*}"
-            MUTABLE="${REST#*|}"
 
-            # 仅处理被启用的变体
-            if ! echo "$ENABLED" | tr ' ' '\n' | grep -qx "$VNAME"; then
-              continue
-            fi
-
+          # 追加一个变体到矩阵(自动计算版本标签 + 存在性检查)
+          add_variant() {
+            local VNAME="$1" BUILD_SERVER="$2" BUILD_FRONTEND="$3" BUILD_STATIC="$4" SUFFIX="$5" MUTABLE="$6"
             # 版本标签: 标准镜像直接用 tag, 其余为 后缀-tag
-            if [ -z "$SUFFIX" ]; then
-              VERSION_TAG="$TAG"
-            else
-              VERSION_TAG="${SUFFIX}-${TAG}"
-            fi
+            local VERSION_TAG
+            if [ -z "$SUFFIX" ]; then VERSION_TAG="$TAG"; else VERSION_TAG="${SUFFIX}-${TAG}"; fi
 
             # 存在性检查(除非强制构建)
-            SHOULD_BUILD="true"
             if [ "$FORCE" != "true" ]; then
               if skopeo inspect docker://docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:$VERSION_TAG > /dev/null 2>&1; then
-                SHOULD_BUILD="false"
                 echo "✔ 镜像 ${{ env.IMAGE_NAME }}:$VERSION_TAG 已存在, 跳过构建。"
+                return
               fi
             fi
 
-            if [ "$SHOULD_BUILD" != "true" ]; then
-              continue
-            fi
-
+            local ENTRY
             ENTRY=$(jq -n \
               --arg name "$VNAME" \
               --arg bs "$BUILD_SERVER" \
@@ -220,12 +183,42 @@ jobs:
               --arg vtag "$VERSION_TAG" \
               '{variant:$name, build_server:$bs, build_frontend:$bf, build_static:$bst, tagsuffix:$suffix, mutable_tag:$mutable, version_tag:$vtag}')
 
-            if [ -z "$MATRIX_ENTRIES" ]; then
-              MATRIX_ENTRIES="$ENTRY"
-            else
-              MATRIX_ENTRIES="$MATRIX_ENTRIES,$ENTRY"
+            if [ -z "$MATRIX_ENTRIES" ]; then MATRIX_ENTRIES="$ENTRY"; else MATRIX_ENTRIES="$MATRIX_ENTRIES,$ENTRY"; fi
+          }
+
+          if [ "$EVENT" = "schedule" ] || [ "${{ github.event.inputs.build_all }}" = "true" ]; then
+            echo "触发方式=$EVENT / build_all=true -> 构建全部 5 种变体"
+            for v in "${VARIANTS[@]}"; do
+              IFS='|' read -r n bs bf bst su mu <<< "$v"
+              add_variant "$n" "$bs" "$bf" "$bst" "$su" "$mu"
+            done
+          else
+            # 手动: 由 3 个组件开关自由搭配出一种组合 -> 映射为某命名变体
+            WEB="${{ github.event.inputs.include_web }}"
+            STATIC="${{ github.event.inputs.include_web_static }}"
+            SERVER="${{ github.event.inputs.include_server }}"
+
+            # 静态文件依赖 Web 前端, 否则无意义(UI 无法禁用此项, 这里做无效处理)
+            if [ "$WEB" != "true" ] && [ "$STATIC" = "true" ]; then
+              echo "⚠ [包含Web静态文件] 已勾选但 [包含Web] 未勾选: 静态文件无前端可服务, 视为无效并自动忽略。"
+              echo "  提示: 未内置静态时, 运行容器需通过 -v 挂载 /app/dist 才能提供 Web 页面。"
+              STATIC="false"
             fi
-          done
+
+            if [ "$WEB" != "true" ] && [ "$SERVER" != "true" ]; then
+              echo "⚠ 未勾选任何组件(Web/联机), 不构建任何镜像。"
+            elif [ "$WEB" = "true" ] && [ "$SERVER" = "true" ] && [ "$STATIC" = "true" ]; then
+              add_variant full true true true "" latest
+            elif [ "$WEB" = "true" ] && [ "$SERVER" = "true" ] && [ "$STATIC" != "true" ]; then
+              add_variant core true true false core core
+            elif [ "$WEB" = "true" ] && [ "$SERVER" != "true" ] && [ "$STATIC" = "true" ]; then
+              add_variant web false true true web web
+            elif [ "$WEB" = "true" ] && [ "$SERVER" != "true" ] && [ "$STATIC" != "true" ]; then
+              add_variant web_core false true false web_core web_core
+            elif [ "$WEB" != "true" ] && [ "$SERVER" = "true" ]; then
+              add_variant server true false false server server
+            fi
+          fi
 
           if [ -z "$MATRIX_ENTRIES" ]; then
             echo "没有需要构建的变体, 输出空矩阵。"
