@@ -1,0 +1,636 @@
+# ==============================================================================
+# 工作流名称: 构建 无名杀 (libnoname/noname) Docker 镜像
+#
+# 整体流程:
+#   1. check 任务:
+#        - 拉取上游 libnoname/noname 最新 Release 的 tag (如 v1.2.3)
+#        - 根据触发方式(定时/手动)与勾选项, 规划要构建的「镜像变体矩阵」:
+#            1) full    标准/全量镜像   noname         (前端+联机+静态, 开箱即用)
+#            2) core    核心镜像        noname:core     (前端+联机, 不内置静态, 运行需 -v 挂载 /app/dist)
+#            3) web     web 镜像        noname:web      (仅前端服务 + 静态)
+#            4) web_core web 核心镜像   noname:web_core  (仅前端服务, 不内置静态)
+#            5) server  server 镜像     noname:server    (仅联机服务器)
+#        - 用 skopeo 检查各变体镜像是否已在 Docker Hub 存在; 存在则跳过, 除非手动勾选强制构建
+#   2. build 任务 (矩阵, 仅在需要构建的变体上执行):
+#        - 下载上游 Release 的 "Source code" 源码包 (GitHub 自动生成的 tar.gz 归档)
+#        - 在构建上下文内动态生成所需的 Dockerfile / .dockerignore / serve.cjs
+#          (全部由本工作流内嵌 heredoc 写出, 不依赖本仓库或 upstream 自带的文件,
+#           因此 upstream 更新只影响源码内容, 构建/启动逻辑独立可维护)
+#        - 用 docker buildx 从源码原生构建多平台镜像并推送到
+#          Docker Hub 与 GitHub Container Registry
+#
+# 触发方式:
+#   - schedule 定时: 每天 UTC 02:00, 自动构建全部 5 种镜像变体
+#   - workflow_dispatch 手动:
+#        * build_all=true (默认) -> 构建全部变体
+#        * build_all=false + 勾选具体变体 -> 仅构建所选变体
+#        * force_build=true -> 忽略存在性检查, 全部强制覆盖
+#
+# 多平台说明:
+#   - 基础镜像 node:24-alpine 自带 amd64/arm64/arm/v7 等多架构支持
+#   - 构建过程纯 JS (Vite + pnpm), 无原生依赖, 跨架构由 QEMU 模拟即可
+#   - 目标平台由 env.PLATFORMS 控制 (默认 linux/amd64,linux/arm64)
+#
+# 配置方法 (Settings → Secrets and variables → Actions):
+#   - Secrets:   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+#   - Variables: NAME      (你的用户名, 防 Fork 误触发)
+#                IMAGE_NAME (可选, 覆盖镜像名, 默认 noname)
+#                PLATFORMS  (可选, 覆盖目标平台列表)
+# ==============================================================================
+name: 构建 无名杀_Docker 镜像
+
+# ==============================================================================
+# 触发条件
+# ==============================================================================
+on:
+  workflow_dispatch:  # 手动触发
+    inputs:
+      force_build:  # 是否强制构建并覆盖已有镜像
+        description: '强制构建并覆盖已有镜像(忽略存在性检查)'
+        type: boolean
+        required: false
+        default: false  # 默认不覆盖: 仍按镜像是否存在决定是否构建
+      build_all:  # 是否构建全部镜像变体
+        description: '构建全部镜像变体(full/core/web/web_core/server)'
+        type: boolean
+        required: false
+        default: true
+      build_full:  # 全量镜像 noname
+        description: '全量镜像 noname (前端+联机+静态, 开箱即用)'
+        type: boolean
+        required: false
+        default: false
+      build_core:  # 核心镜像 noname:core
+        description: '核心镜像 noname:core (前端+联机, 不内置静态)'
+        type: boolean
+        required: false
+        default: false
+      build_web:  # web 镜像 noname:web
+        description: 'web 镜像 noname:web (仅前端服务+静态)'
+        type: boolean
+        required: false
+        default: false
+      build_web_core:  # web 核心镜像 noname:web_core
+        description: 'web 核心镜像 noname:web_core (仅前端服务)'
+        type: boolean
+        required: false
+        default: false
+      build_server:  # server 镜像 noname:server
+        description: 'server 镜像 noname:server (仅联机服务器)'
+        type: boolean
+        required: false
+        default: false
+  schedule:  # 定时触发
+    # 每天 UTC 时间 02:00 运行 (Cron 语法) -> 构建全部变体
+    - cron: '0 2 * * *'
+
+# ==============================================================================
+# 全局环境变量
+# ==============================================================================
+env:
+  # ⭐目标项目所有者(GitHub用户名)
+  UPSTREAM_OWNER: 'libnoname'
+  # ⭐目标项目名称(GitHub仓库名)
+  UPSTREAM_REPO: 'noname'
+  # ⭐构建的镜像名称(自定义需要构建的镜像名称)
+  IMAGE_NAME: 'noname'
+  # ⭐多平台列表: buildx 从源码原生构建, 非本机架构用 QEMU 模拟。
+  #   要增删平台直接改这一行 (如 'linux/amd64,linux/arm64,linux/arm/v7')。
+  PLATFORMS: linux/amd64,linux/arm64'
+  # ⭐构建开关: 不再在全局写死, 而是由下方矩阵(check 任务生成的 matrix)按变体注入:
+  #   BUILD_SERVER  是否内置联机服务器 @noname/server
+  #   BUILD_FRONTEND 是否内置前端静态服务 @noname/fs
+  #   BUILD_STATIC  是否内置 Web 静态资源(若 false 需运行时 -v 挂载 /app/dist)
+  #   各变体组合见 check 任务中的 VARIANTS 定义。
+
+# ==============================================================================
+# 任务定义
+# ==============================================================================
+jobs:
+  # --------------------------------------------------------------------
+  # 任务 1: 获取版本 + 规划镜像变体矩阵 + 存在性检查
+  # --------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-latest
+    # 确保只在自己仓库中运行, 避免 Fork 仓库的无效运行
+    if: ${{ github.repository_owner == (vars.NAME || 'Neo-403') }}
+
+    outputs:
+      latest_tag: ${{ steps.get_release.outputs.tag }}
+      version: ${{ steps.get_release.outputs.version }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+
+    steps:
+      - name: 获取最新的 Release Tag
+        id: get_release
+        run: |
+          echo "正在从 ${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }} 获取最新 release..."
+          LATEST_TAG=$(curl -sL https://api.github.com/repos/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/releases/latest | jq -r ".tag_name")
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" == "null" ]; then
+            echo "无法获取最新 release tag，可能是网络问题或仓库不存在。"
+            exit 1
+          fi
+          # 去掉 tag 前缀 v，得到纯版本号 (v1.2.3 -> 1.2.3)
+          VERSION="${LATEST_TAG#v}"
+          echo "最新的 release tag 是: $LATEST_TAG (版本号: $VERSION)"
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: 规划构建矩阵(变体 + 存在性检查)
+        id: plan
+        run: |
+          TAG="${{ steps.get_release.outputs.tag }}"
+          FORCE="${{ github.event.inputs.force_build }}"
+          EVENT="${{ github.event_name }}"
+
+          # 各变体定义: 名称|BUILD_SERVER|BUILD_FRONTEND|BUILD_STATIC|标签后缀|可变标签
+          #   - 标签后缀为空 -> 标准镜像(用 latest + 版本tag)
+          #   - 可变标签: 不带版本的后缀标签(如 core/web/server), 标准镜像用 latest
+          VARIANTS=(
+            "full|true|true|true||latest"
+            "core|true|true|false|core|core"
+            "web|false|true|true|web|web"
+            "web_core|false|true|false|web_core|web_core"
+            "server|true|false|false|server|server"
+          )
+
+          # ---- 决定启用哪些变体 ----
+          if [ "$EVENT" = "schedule" ] || [ "${{ github.event.inputs.build_all }}" = "true" ]; then
+            echo "触发方式=$EVENT / build_all=true -> 构建全部变体"
+            ENABLED="full core web web_core server"
+          else
+            ENABLED=""
+            [ "${{ github.event.inputs.build_full }}" = "true" ]     && ENABLED="$ENABLED full"
+            [ "${{ github.event.inputs.build_core }}" = "true" ]     && ENABLED="$ENABLED core"
+            [ "${{ github.event.inputs.build_web }}" = "true" ]      && ENABLED="$ENABLED web"
+            [ "${{ github.event.inputs.build_web_core }}" = "true" ] && ENABLED="$ENABLED web_core"
+            [ "${{ github.event.inputs.build_server }}" = "true" ]   && ENABLED="$ENABLED server"
+            echo "手动选择变体: ${ENABLED:-<无, 将不构建任何变体>}"
+          fi
+
+          # ---- 安装 skopeo 用于存在性检查 ----
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+          MATRIX_ENTRIES=""
+          for v in "${VARIANTS[@]}"; do
+            VNAME="${v%%|*}"
+            REST="${v#*|}"
+            BUILD_SERVER="${REST%%|*}"
+            REST="${REST#*|}"
+            BUILD_FRONTEND="${REST%%|*}"
+            REST="${REST#*|}"
+            BUILD_STATIC="${REST%%|*}"
+            REST="${REST#*|}"
+            SUFFIX="${REST%%|*}"
+            MUTABLE="${REST#*|}"
+
+            # 仅处理被启用的变体
+            if ! echo "$ENABLED" | tr ' ' '\n' | grep -qx "$VNAME"; then
+              continue
+            fi
+
+            # 版本标签: 标准镜像直接用 tag, 其余为 后缀-tag
+            if [ -z "$SUFFIX" ]; then
+              VERSION_TAG="$TAG"
+            else
+              VERSION_TAG="${SUFFIX}-${TAG}"
+            fi
+
+            # 存在性检查(除非强制构建)
+            SHOULD_BUILD="true"
+            if [ "$FORCE" != "true" ]; then
+              if skopeo inspect docker://docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:$VERSION_TAG > /dev/null 2>&1; then
+                SHOULD_BUILD="false"
+                echo "✔ 镜像 ${{ env.IMAGE_NAME }}:$VERSION_TAG 已存在, 跳过构建。"
+              fi
+            fi
+
+            if [ "$SHOULD_BUILD" != "true" ]; then
+              continue
+            fi
+
+            ENTRY=$(jq -n \
+              --arg name "$VNAME" \
+              --arg bs "$BUILD_SERVER" \
+              --arg bf "$BUILD_FRONTEND" \
+              --arg bst "$BUILD_STATIC" \
+              --arg suffix "$SUFFIX" \
+              --arg mutable "$MUTABLE" \
+              --arg vtag "$VERSION_TAG" \
+              '{variant:$name, build_server:$bs, build_frontend:$bf, build_static:$bst, tagsuffix:$suffix, mutable_tag:$mutable, version_tag:$vtag}')
+
+            if [ -z "$MATRIX_ENTRIES" ]; then
+              MATRIX_ENTRIES="$ENTRY"
+            else
+              MATRIX_ENTRIES="$MATRIX_ENTRIES,$ENTRY"
+            fi
+          done
+
+          if [ -z "$MATRIX_ENTRIES" ]; then
+            echo "没有需要构建的变体, 输出空矩阵。"
+            echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+          else
+            echo "matrix={\"include\":[$MATRIX_ENTRIES]}" >> $GITHUB_OUTPUT
+            echo "===== 待构建矩阵: ====="
+            echo "$MATRIX_ENTRIES" | jq .
+          fi
+
+  # --------------------------------------------------------------------
+  # 任务 2: 下载源码 + 动态生成构建文件 + 矩阵多平台构建并推送
+  # --------------------------------------------------------------------
+  build:
+    needs: check
+    if: needs.check.result == 'success'
+    runs-on: ubuntu-latest
+    # 任一变体失败不影响其余变体
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.check.outputs.matrix) }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 步骤 1: 下载上游 Release 的 "Source code" 源码包并解压到 build-context
+      # 即 GitHub 为每个 tag 自动生成的源码归档 (Release 页面的 "Source code (tar.gz)")。
+      - name: 下载上游 Source code 源码包
+        run: |
+          TAG="${{ needs.check.outputs.latest_tag }}"
+
+          rm -rf build-context && mkdir -p build-context
+
+          # GitHub 自动生成的源码归档 URL (等价于 Release 资产中的 "Source code (tar.gz)")
+          SRC_URL="https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/archive/refs/tags/${TAG}.tar.gz"
+          echo "下载源码包: $SRC_URL"
+
+          wget -qO- "$SRC_URL" | tar -xz -C build-context --strip-components=1
+
+          echo "===== 源码根目录文件: ====="
+          ls -la build-context
+
+          # 基本结构校验, 防止上游归档结构变动导致后续构建静默失败
+          if [ ! -f build-context/package.json ]; then
+            echo "错误: 未找到 package.json, 源码包结构异常!"
+            exit 1
+          fi
+
+      # 步骤 2: 生成 .dockerignore (排除 node_modules/dist 等, 避免污染构建上下文)
+      - name: 生成 .dockerignore
+        run: |
+          cat > build-context/.dockerignore << 'EOF'
+          # 排除 node_modules：pnpm 在 Windows 上大量使用符号链接，
+          # Docker 打构建上下文时会因无法访问而报错；且 builder 阶段会重新 pnpm install
+          **/node_modules
+
+          # 排除构建产物：packages/fs/dist 会由 pnpm build 在容器内重新生成，
+          # 根目录 dist 为前端产物，运行时由挂载卷提供，均不需要进上下文
+          **/dist
+
+          # 杂项
+          .git
+          *.log
+          .DS_Store
+          EOF
+
+      # 步骤 3: 生成 serve.cjs (统一启动器: 按环境变量启用前端/联机服务)
+      - name: 生成 serve.cjs
+        run: |
+          cat > build-context/serve.cjs << 'EOF'
+          // serve.cjs
+          // 统一启动器: 通过环境变量决定启用哪些服务(默认都启用), 便于在多个镜像间复用。
+          //   ENABLE_FRONTEND=true/false -> fs 静态服务(绑127.0.0.1) + 内部 TCP 转发(0.0.0.0)
+          //   ENABLE_SERVER=true/false   -> ws 联机服务器(绑全部网卡)
+          // 不修改任何 dist 产物；日志统一打到 stdout/stderr，便于 docker logs 调试。
+          //
+          // 参数:
+          //   frontend: APP_PORT(8089) PUBLIC_PORT(80) DIRNAME(/app/dist)
+          //   server:   SERVER_PORT(8080)
+          //   调试:     DEBUG=true -> 开启 fastify 请求日志
+
+          const net = require("net");
+          const fs = require("fs");
+          const { spawn } = require("child_process");
+
+          const ENABLE_FRONTEND =
+            (process.env.ENABLE_FRONTEND ?? "true").toLowerCase() !== "false";
+          const ENABLE_SERVER =
+            (process.env.ENABLE_SERVER ?? "true").toLowerCase() !== "false";
+          const DEBUG = (process.env.DEBUG ?? "false").toLowerCase() === "true";
+
+          const children = [];
+          let frontendStarted = false;
+          const out = (tag, ...a) => process.stdout.write(`[${tag}] ` + a.join(" ") + "\n");
+          const err = (tag, ...a) => process.stderr.write(`[${tag}] ` + a.join(" ") + "\n");
+
+          // ---- 联机服务器(ws) ----
+          if (ENABLE_SERVER) {
+            if (!fs.existsSync("/app/server/dist/cli.cjs")) {
+              err(
+                "server",
+                "未找到 /app/server/dist/cli.cjs: 构建时未启用 BUILD_SERVER, 跳过联机服务器"
+              );
+            } else {
+              const SERVER_PORT = Number(process.env.SERVER_PORT || 8080);
+              const p = spawn(process.execPath, ["dist/cli.cjs"], {
+                cwd: "/app/server",
+                env: { ...process.env, PORT: String(SERVER_PORT) },
+              });
+              // 显式管道化子进程输出, 加前缀后写入容器 stdout/stderr
+              p.stdout.on("data", (d) => process.stdout.write(`[server] ${d}`));
+              p.stderr.on("data", (d) => process.stderr.write(`[server] ${d}`));
+              p.on("exit", (code) => {
+                err("server", `进程退出, code=${code}`);
+                process.exit(code ?? 0);
+              });
+              children.push(p);
+              out("server", `启动联机服务器, 端口 ${SERVER_PORT}`);
+            }
+          }
+
+          // ---- 前端静态服务(fs) + TCP 转发 ----
+          if (ENABLE_FRONTEND) {
+            if (!fs.existsSync("/app/fs/dist/index.cjs")) {
+              err(
+                "frontend",
+                "未找到 /app/fs/dist/index.cjs: 构建时未启用 BUILD_FRONTEND, 跳过前端静态服务"
+              );
+            } else {
+              const APP_PORT = Number(process.env.APP_PORT || 8089);
+              const PUBLIC_PORT = Number(process.env.PUBLIC_PORT || 80);
+              const DIRNAME = process.env.DIRNAME || "/app/dist";
+
+              if (!fs.existsSync(DIRNAME)) {
+                err(
+                  "frontend",
+                  `静态目录 ${DIRNAME} 不存在: 构建时未 BUILD_STATIC 且运行未挂载 -v, 前端将 404`
+                );
+              }
+
+              const fsMod = require("/app/fs/dist/index.cjs");
+              fsMod.default({
+                ...fsMod.defaultConfig,
+                dirname: DIRNAME,
+                port: APP_PORT,
+                server: true, // 避免容器内尝试打开浏览器
+                debug: DEBUG, // 开启 fastify 请求日志(调试用)
+              });
+              out("frontend", `启动静态服务, dirname=${DIRNAME}, 回环端口 ${APP_PORT}`);
+
+              const startProxy = () => {
+                const proxy = net.createServer((client) => {
+                  const upstream = net.connect(APP_PORT, "127.0.0.1");
+                  upstream.on("connect", () => {
+                    client.pipe(upstream);
+                    upstream.pipe(client);
+                  });
+                  upstream.on("error", () => client.destroy());
+                  client.on("error", () => upstream.destroy());
+                });
+                proxy.listen(PUBLIC_PORT, "0.0.0.0", () => {
+                  out(
+                    "frontend",
+                    `转发器监听 0.0.0.0:${PUBLIC_PORT} -> 127.0.0.1:${APP_PORT}`
+                  );
+                });
+              };
+
+              // 等 fs 真正起来后再开转发, 避免启动窗口期把首请求打挂
+              const waitForApp = (port, tries = 50) => {
+                const s = net.connect(port, "127.0.0.1");
+                s.on("connect", () => {
+                  s.destroy();
+                  startProxy();
+                });
+                s.on("error", () => {
+                  s.destroy();
+                  if (tries <= 0) {
+                    err("frontend", `未在 127.0.0.1:${port} 就绪, 转发器未启动`);
+                    shutdown();
+                    return;
+                  }
+                  setTimeout(() => waitForApp(port, tries - 1), 200);
+                });
+              };
+              waitForApp(APP_PORT);
+              frontendStarted = true;
+            } // 结束 else(产物存在分支)
+          } // 结束 if (ENABLE_FRONTEND)
+
+          // 兜底保活: 既没有子进程也没有前端监听时, 避免进程直接退出(多为构建/配置不一致)
+          if (children.length === 0 && !frontendStarted) {
+            setInterval(() => {}, 1 << 30);
+          }
+
+          function shutdown() {
+            children.forEach((c) => {
+              try {
+                c.kill();
+              } catch {}
+            });
+            process.exit(0);
+          }
+          process.on("SIGINT", shutdown);
+          process.on("SIGTERM", shutdown);
+          EOF
+
+      # 步骤 4: 生成 Dockerfile (从源码构建 + 提炼生产依赖 + 多平台友好)
+      - name: 生成 Dockerfile
+        run: |
+          cat > build-context/Dockerfile << 'EOF'
+          # 统一构建文件: 编译期通过 --build-arg 自由组合要打进镜像的内容
+          #   BUILD_SERVER=true/false   是否构建并内置联机服务器 @noname/server (默认 true)
+          #   BUILD_FRONTEND=true/false 是否构建并内置前端静态服务器 @noname/fs (默认 true)
+          #   BUILD_STATIC=true/false   是否一并编译 Web 客户端静态资源并内置 (默认 true:
+          #                              正常构建即内置静态, 无需运行时挂载; 设 false 则需 -v 挂载 /app/dist)
+          # 运行时开关 ENABLE_SERVER/ENABLE_FRONTEND 默认跟随上面的 BUILD_* 值, 可用 -e 覆盖。
+          #
+          # 多平台: 基础镜像 node:24-alpine 自带 amd64/arm64/v7, buildx 按目标平台选对应镜像,
+          # 构建过程纯 JS (Vite + pnpm), 无原生依赖, 跨架构由 QEMU 模拟即可, 无需按平台预处理。
+          #
+          # 本工作流会为每种镜像变体传入不同的 build-arg 组合:
+          #   全量  (noname)         : BUILD_SERVER=true  BUILD_FRONTEND=true  BUILD_STATIC=true
+          #   核心  (noname:core)    : BUILD_SERVER=true  BUILD_FRONTEND=true  BUILD_STATIC=false
+          #   web   (noname:web)     : BUILD_SERVER=false BUILD_FRONTEND=true  BUILD_STATIC=true
+          #   web_core(noname:web_core): BUILD_SERVER=false BUILD_FRONTEND=true  BUILD_STATIC=false
+          #   server(noname:server)  : BUILD_SERVER=true  BUILD_FRONTEND=false BUILD_STATIC=false
+
+          # ============ 构建阶段 ============
+          FROM node:24-alpine AS builder
+
+          # 显式设定工作目录为 /app (基础镜像默认是 /)。
+          # 否则 COPY . . 落到 /, pnpm build 生成的静态产物会落到 /dist 而非 /app/dist。
+          WORKDIR /app
+
+          # ---- 构建开关(通过 --build-arg 传入) ----
+          ARG BUILD_SERVER=true
+          ARG BUILD_FRONTEND=true
+          ARG BUILD_STATIC=true
+
+          # 安装 pnpm + 配置镜像源加速
+          RUN \
+              sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
+              npm config set registry https://registry.npmmirror.com && \
+              npm install -g pnpm@10
+
+          # 前端/联机都用不到 electron/playwright, 跳过它们庞大的二进制下载(不影响构建结果)
+          ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
+          ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+          # 复制项目代码(上下文由 .dockerignore 控制, 排除 node_modules/dist 等)
+          COPY . .
+
+          # 安装依赖(锁定版本); 用 BuildKit 缓存挂载 pnpm store, 重复构建时依赖从缓存读取
+          RUN --mount=type=cache,target=/root/.local/share/pnpm/store,id=noname-pnpm-store \
+              pnpm config set registry https://registry.npmmirror.com && \
+              pnpm install --frozen-lockfile
+
+          # 确定性、无竞态地按依赖顺序构建工作区包(顺序由我们掌控, 不修改任何源码):
+          #   1) @noname/fs     -> 产出 dist/index.d.ts 等(供 @noname/jit 的 dts 使用)
+          #   2) @noname/jit    -> 此时 fs 的 dts 已就绪, 不再竞态
+          #   3) noname         -> 核心 Web(Vite 多产物 -> apps/core/dist, 含 index.html/noname/src/...)
+          #   4) 扩展包          -> 可选, 失败不阻断
+          #   5) @noname/server -> 联机服务器(cli.cjs)
+          # 注意: 不可用 `pnpm -F noname... build`(只匹配 noname 及其依赖 fs/jit, 漏掉 server);
+          # 也不能用 `noname... & !@noname/fs & !@noname/jit`(该组合会把 noname 核心也排除,
+          # 导致 apps/core/dist 为空)。这里逐个显式构建, 既确定可复现又完整覆盖全部包。
+          RUN pnpm --filter @noname/fs build && \
+              pnpm --filter @noname/jit build && \
+              pnpm --filter noname build && \
+              (pnpm -F ./packages/extension/** build || true) && \
+              pnpm --filter @noname/server build
+
+          # 前端静态服务器 @noname/fs (提炼生产依赖; 未启用则留空目录占位)
+          RUN if [ "$BUILD_FRONTEND" = "true" ]; then \
+                pnpm --filter @noname/fs deploy --prod /deploy/fs; \
+              else mkdir -p /deploy/fs; fi
+
+          # 联机服务器 @noname/server (提炼生产依赖; 未启用则留空目录占位)
+          RUN if [ "$BUILD_SERVER" = "true" ]; then \
+                pnpm --filter @noname/server deploy --prod /deploy/server; \
+              else mkdir -p /deploy/server; fi
+
+          # 合并 Web 客户端静态资源(默认开启)。完全复刻根 scripts/build.ts 的合并逻辑:
+          # apps/core/dist(核心 web, 含 index.html/noname/src/...) + audio/image/extension/docs 等。
+          # 各目录复制用 `;' 分隔(非 `&&'), 任一处复制失败不影响其它目录; 不删除任何运行时文件。
+          RUN if [ "$BUILD_STATIC" = "true" ]; then \
+                echo "===== 编译静态资源 BUILD_STATIC=true =====" && \
+                rm -rf /app/dist && mkdir -p /app/dist && \
+                cp -r /app/apps/core/dist/. /app/dist/; \
+                cp -r /app/apps/core/audio /app/dist/audio 2>/dev/null || true; \
+                cp -r /app/apps/core/image /app/dist/image 2>/dev/null || true; \
+                cp -r /app/apps/core/extension /app/dist/extension 2>/dev/null || true; \
+                cp -r /app/docs /app/dist/docs 2>/dev/null || true; \
+                cp /app/.nomedia /app/dist/.nomedia 2>/dev/null || true; \
+                cp /app/LICENSE /app/dist/LICENSE; \
+                cp /app/README.md /app/dist/README.md; \
+                echo "===== 静态资源体积: =====" && du -sh /app/dist && \
+                echo "===== 静态资源产物: =====" && ls /app/dist; \
+              else \
+                echo "===== 跳过静态资源编译 (BUILD_STATIC=$BUILD_STATIC) =====" && mkdir -p /app/dist; \
+              fi
+
+          # ============ 生产阶段 ============
+          FROM node:24-alpine
+
+          # 重新声明 build arg, 使运行时 ENV 默认值能跟随 --build-arg
+          ARG BUILD_SERVER
+          ARG BUILD_FRONTEND
+          ARG BUILD_STATIC
+
+          ENV NODE_ENV=production
+          # 运行时开关默认跟随构建开关(可被 -e 覆盖)
+          ENV ENABLE_SERVER=${BUILD_SERVER}
+          ENV ENABLE_FRONTEND=${BUILD_FRONTEND}
+
+          # 创建非 root 用户
+          RUN addgroup -g 1001 -S nodejs && \
+              adduser -S nodejs -u 1001
+          USER nodejs
+          WORKDIR /app
+
+          # 复制各服务产物(未构建的目录为空, 由 serve.cjs 在运行时按需跳过)
+          COPY --from=builder --chown=nodejs:nodejs /deploy/fs ./fs
+          COPY --from=builder --chown=nodejs:nodejs /deploy/server ./server
+          # 静态资源: 若 BUILD_STATIC=true 则内置; 否则为空目录, 由运行时 -v 挂载覆盖
+          COPY --from=builder --chown=nodejs:nodejs /app/dist ./dist
+          # 统一启动文件(纯 Node 标准库, 不修改任何 dist 产物)
+          COPY serve.cjs /app/serve.cjs
+
+          # 端口: 80=前端(静态, 0.0.0.0 经转发暴露) 8080=联机(ws)
+          EXPOSE 80 8080
+
+          # 运行参数(可用 -e 覆盖):
+          #   ENABLE_FRONTEND/ENABLE_SERVER(默认跟随 BUILD_*)
+          #   APP_PORT(8089) PUBLIC_PORT(80) DIRNAME(/app/dist) SERVER_PORT(8080) DEBUG(true 开 fastify 日志)
+          # 静态资源挂载示例(未 BUILD_STATIC 时必需):
+          #   -v /path/to/dist:/app/dist
+          CMD ["node", "/app/serve.cjs"]
+          EOF
+
+      # 步骤 5: 设置 QEMU (用于跨架构构建, 如在 amd64 机器上构建 arm64 镜像)
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # 步骤 6: 设置 Docker Buildx
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 步骤 7: 登录到 Docker Hub
+      - name: 登录到 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 步骤 8: 登录到 GitHub Container Registry
+      - name: 登录到 GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 步骤 9: 计算本变体的镜像标签
+      #   标准镜像(full)    : latest + 版本tag(如 v1.2.3)
+      #   其余变体          : 后缀标签(如 core/web/web_core/server) + 后缀-版本tag(如 core-v1.2.3)
+      - name: 计算镜像标签
+        id: tags
+        run: |
+          DH="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
+          GH="ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}"
+          VT="${{ matrix.version_tag }}"
+          MT="${{ matrix.mutable_tag }}"
+          {
+            echo "tags<<EOF"
+            echo "$DH:$VT"
+            echo "$DH:$MT"
+            echo "$GH:$VT"
+            echo "$GH:$MT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "===== 变体 ${{ matrix.variant }} 标签: ====="
+          echo "$DH:$VT"; echo "$DH:$MT"; echo "$GH:$VT"; echo "$GH:$MT"
+
+      # 步骤 10: 从源码多平台构建并推送镜像
+      - name: 构建并推送 Docker 镜像 (${{ matrix.variant }})
+        uses: docker/build-push-action@v5
+        with:
+          # 指定构建上下文为我们创建的 build-context 目录
+          context: build-context
+          # 指定 Dockerfile 路径 (由上方步骤动态生成)
+          file: build-context/Dockerfile
+          # 推送到仓库
+          push: true
+          # 使用上一步生成的标签
+          tags: ${{ steps.tags.outputs.tags }}
+          # 要构建的平台, 由 env.PLATFORMS 控制
+          platforms: ${{ env.PLATFORMS }}
+          # 构建开关, 由矩阵按变体注入不同的 build-arg 组合
+          build-args: |
+            BUILD_SERVER=${{ matrix.build_server }}
+            BUILD_FRONTEND=${{ matrix.build_frontend }}
+            BUILD_STATIC=${{ matrix.build_static }}
+          # 使用 GitHub Actions 的缓存来加速构建
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
