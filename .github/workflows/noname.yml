@@ -21,7 +21,7 @@
 #
 # 触发方式:
 #   - schedule 定时: 每天 UTC 02:00, 自动构建全部 5 种镜像变体
-#   - workflow_dispatch 手动(自由搭配组件开关):
+#   - workflow_dispatch 手动(3 个组件开关自由搭配):
 #        * include_web       是否包含 Web 前端服务 @noname/fs
 #        * include_web_static 是否包含 Web 静态文件(仅当 include_web 时生效;
 #                             否则需运行时 -v 挂载 /app/dist)
@@ -30,7 +30,6 @@
 #          web+static+server -> 标准 noname        ; web+server(无static) -> noname:core
 #          web+static(无server) -> noname:web      ; web(无static/server)  -> noname:web_core
 #          server(无web)      -> noname:server
-#        * build_all=true  -> 忽略组件开关, 直接构建全部 5 种变体
 #        * force_build=true -> 忽略存在性检查, 强制覆盖
 #
 # 多平台说明:
@@ -57,11 +56,6 @@ on:
         type: boolean
         required: false
         default: false  # 默认不覆盖: 仍按镜像是否存在决定是否构建
-      build_all:  # 是否构建全部 5 种变体(忽略下方组件开关)
-        description: '构建全部 5 种变体(full/core/web/web_core/server), 忽略下方组件开关'
-        type: boolean
-        required: false
-        default: false
       include_web:  # 是否包含 Web 前端服务
         description: '包含 Web 前端服务 @noname/fs'
         type: boolean
@@ -186,8 +180,8 @@ jobs:
             if [ -z "$MATRIX_ENTRIES" ]; then MATRIX_ENTRIES="$ENTRY"; else MATRIX_ENTRIES="$MATRIX_ENTRIES,$ENTRY"; fi
           }
 
-          if [ "$EVENT" = "schedule" ] || [ "${{ github.event.inputs.build_all }}" = "true" ]; then
-            echo "触发方式=$EVENT / build_all=true -> 构建全部 5 种变体"
+          if [ "$EVENT" = "schedule" ]; then
+            echo "触发方式=schedule -> 构建全部 5 种变体"
             for v in "${VARIANTS[@]}"; do
               IFS='|' read -r n bs bf bst su mu <<< "$v"
               add_variant "$n" "$bs" "$bf" "$bst" "$su" "$mu"
