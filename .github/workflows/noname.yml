@@ -8,7 +8,7 @@
 #            1) full    标准/全量镜像   noname         (前端+联机+静态, 开箱即用)
 #            2) core    核心镜像        noname:core     (前端+联机, 不内置静态, 运行需 -v 挂载 /app/dist)
 #            3) web     web 镜像        noname:web      (仅前端服务 + 静态)
-#            4) web_core web 核心镜像   noname:web_core  (仅前端服务, 不内置静态)
+#            4) web-core web 核心镜像  noname:web-core  (仅前端服务, 不内置静态)
 #            5) server  server 镜像     noname:server    (仅联机服务器)
 #        - 用 skopeo 检查各变体镜像是否已在 Docker Hub 存在; 存在则跳过, 除非手动勾选强制构建
 #   2. build 任务 (顺序, 而非并行矩阵):
@@ -19,7 +19,7 @@
 #        - 用 docker buildx 在「同一台 runner」上逐个变体从源码原生构建多平台镜像并推送:
 #            * 标准镜像(full) / web 变体含静态资源, 体积特别大 -> 推送后立即清理本地
 #              buildx 构建缓存与悬空镜像, 释放磁盘后再构建下一个变体;
-#            * core / web_core / server 不含静态资源 -> 保留本地缓存, 不清理, 构建更快;
+#            * core / web-core / server 不含静态资源 -> 保留本地缓存, 不清理, 构建更快;
 #            * 始终使用 GitHub Actions 缓存 (type=gha) 复用各阶段构建层, 加速后续构建。
 #        - 推送到 Docker Hub 与 GitHub Container Registry
 #
@@ -33,10 +33,10 @@
 #        * include_server    是否包含联机服务器 @noname/server
 #        未勾选 build_all 时, 以上三者组合出一种镜像(无效组合如"仅静态"会被忽略); 映射为 5 种命名变体:
 #          web+static+server -> 标准 noname            (noname:latest + noname:vTag)
-#          web+server(无static) -> noname:core         (noname:core-latest + noname:core-vTag)
-#          web+static(无server) -> noname:web          (noname:web-latest + noname:web-vTag)
-#          web(无static/server)  -> noname:web_core    (noname:web_core-latest + noname:web_core-vTag)
-#          server(无web)      -> noname:server         (noname:server-latest + noname:server-vTag)
+#          web+server(无static) -> noname:core         (noname:core + noname:core_vTag)
+#          web+static(无server) -> noname:web          (noname:web + noname:web_vTag)
+#          web(无static/server)  -> noname:web-core    (noname:web-core + noname:web-core_vTag)
+#          server(无web)      -> noname:server         (noname:server + noname:server_vTag)
 #        * force_build=true -> 忽略存在性检查, 强制覆盖
 #
 # 多平台说明:
@@ -151,14 +151,14 @@ jobs:
 
           # 各变体定义: 名称|BUILD_SERVER|BUILD_FRONTEND|BUILD_STATIC|标签后缀|可变标签
           #   - 标准镜像(full): 可变标签=latest, 版本标签=vTag (noname:latest + noname:vTag)
-          #   - 其余变体: 可变标签=<后缀>-latest, 版本标签=<后缀>-vTag
-          #       (如 noname:core-latest + noname:core-vTag)
+          #   - 其余变体: 可变标签=标签后缀(不带 -latest), 版本标签=<后缀>_vTag
+          #       (如 noname:core + noname:core_vTag)  -- v 前用下划线; 变体名含 _ 的(web_core)改连字符 web-core
           VARIANTS=(
             "full|true|true|true||latest"
-            "core|true|true|false|core|core-latest"
-            "web|false|true|true|web|web-latest"
-            "web_core|false|true|false|web_core|web_core-latest"
-            "server|true|false|false|server|server-latest"
+            "core|true|true|false|core|core"
+            "web|false|true|true|web|web"
+            "web-core|false|true|false|web-core|web-core"
+            "server|true|false|false|server|server"
           )
 
           # ---- 安装 skopeo 用于存在性检查 ----
@@ -172,7 +172,7 @@ jobs:
             local VNAME="$1" BUILD_SERVER="$2" BUILD_FRONTEND="$3" BUILD_STATIC="$4" SUFFIX="$5" MUTABLE="$6"
             # 版本标签: 标准镜像直接用 tag, 其余为 后缀-tag
             local VERSION_TAG
-            if [ -z "$SUFFIX" ]; then VERSION_TAG="$TAG"; else VERSION_TAG="${SUFFIX}-${TAG}"; fi
+            if [ -z "$SUFFIX" ]; then VERSION_TAG="$TAG"; else VERSION_TAG="${SUFFIX}_${TAG}"; fi
 
             # 存在性检查(除非强制构建)
             if [ "$FORCE" != "true" ]; then
@@ -234,7 +234,7 @@ jobs:
             elif [ "$WEB" = "true" ] && [ "$SERVER" != "true" ] && [ "$STATIC" = "true" ]; then
               add_variant web false true true web web
             elif [ "$WEB" = "true" ] && [ "$SERVER" != "true" ] && [ "$STATIC" != "true" ]; then
-              add_variant web_core false true false web_core web_core
+              add_variant web-core false true false web-core web-core
             elif [ "$WEB" != "true" ] && [ "$SERVER" = "true" ]; then
               add_variant server true false false server server
             fi
@@ -468,7 +468,7 @@ jobs:
           #   全量  (noname)         : BUILD_SERVER=true  BUILD_FRONTEND=true  BUILD_STATIC=true
           #   核心  (noname:core)    : BUILD_SERVER=true  BUILD_FRONTEND=true  BUILD_STATIC=false
           #   web   (noname:web)     : BUILD_SERVER=false BUILD_FRONTEND=true  BUILD_STATIC=true
-          #   web_core(noname:web_core): BUILD_SERVER=false BUILD_FRONTEND=true  BUILD_STATIC=false
+          #   web-core(noname:web-core): BUILD_SERVER=false BUILD_FRONTEND=true  BUILD_STATIC=false
           #   server(noname:server)  : BUILD_SERVER=true  BUILD_FRONTEND=false BUILD_STATIC=false
 
           # ============ 构建阶段 ============
@@ -609,7 +609,7 @@ jobs:
 
       # 步骤 9: 顺序构建并推送各变体镜像
       #   循环遍历 check 任务规划的变体矩阵, 逐个:
-      #     - 计算本变体标签 (标准=latest+vTag; 其余=<类型>-latest+<类型>-vTag)
+      #     - 计算本变体标签 (标准=latest+vTag; 其余=<类型>_<类型>_vTag, 且 latest 不带 -latest 后缀)
       #     - docker buildx build --push 多平台构建并推送 (gha 缓存加速)
       #     - 若含静态资源(镜像特别大): 推送后清理本地 buildx 缓存/悬空镜像释放磁盘
       #     - 若不含静态资源: 保留本地缓存, 不清理 (更快)
