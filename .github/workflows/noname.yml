@@ -62,7 +62,7 @@ on:
         required: false
         default: true
       include_web_static:  # 是否包含 Web 静态文件(仅当 include_web 时生效)
-        description: '包含 Web 静态文件(依赖[包含Web]; 若未勾选前端则此项无效并自动忽略, 运行时需 -v 挂载 /app/dist)'
+        description: '包含 Web 静态文件(未勾选Web运行时需挂载 /app/dist)'
         type: boolean
         required: false
         default: true
@@ -457,7 +457,7 @@ jobs:
           # 安装 pnpm + 配置镜像源加速
           RUN \
               sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
-              npm config set registry https://registry.npmmirror.com && \
+              # npm config set registry https://registry.npmmirror.com && \
               npm install -g pnpm@10
 
           # 前端/联机都用不到 electron/playwright, 跳过它们庞大的二进制下载(不影响构建结果)
@@ -469,7 +469,7 @@ jobs:
 
           # 安装依赖(锁定版本); 用 BuildKit 缓存挂载 pnpm store, 重复构建时依赖从缓存读取
           RUN --mount=type=cache,target=/root/.local/share/pnpm/store,id=noname-pnpm-store \
-              pnpm config set registry https://registry.npmmirror.com && \
+              # pnpm config set registry https://registry.npmmirror.com && \
               pnpm install --frozen-lockfile
 
           # 确定性、无竞态地按依赖顺序构建工作区包(顺序由我们掌控, 不修改任何源码):
@@ -584,8 +584,8 @@ jobs:
       - name: 计算镜像标签
         id: tags
         run: |
-          DH="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
-          GH="ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}"
+          DH="${{ toLower(secrets.DOCKERHUB_USERNAME) }}/${{ env.IMAGE_NAME }}"
+          GH="ghcr.io/${{ toLower(github.repository_owner) }}/${{ env.IMAGE_NAME }}"
           VT="${{ matrix.version_tag }}"
           MT="${{ matrix.mutable_tag }}"
           {
