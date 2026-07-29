@@ -249,7 +249,8 @@ jobs:
             echo "matrix={\"include\":[$MATRIX_ENTRIES]}" >> $GITHUB_OUTPUT
             echo "build_needed=true" >> $GITHUB_OUTPUT
             echo "===== 待构建矩阵: ====="
-            echo "$MATRIX_ENTRIES" | jq .
+            # 注意: MATRIX_ENTRIES 是逗号分隔的多对象(无方括号), 需包成数组再 jq 解析, 否则报 "Expected value before ','"
+            echo "[$MATRIX_ENTRIES]" | jq .
           fi
 
   # --------------------------------------------------------------------
