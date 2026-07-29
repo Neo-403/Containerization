@@ -167,7 +167,7 @@ jobs:
             fi
 
             local ENTRY
-            ENTRY=$(jq -n \
+            ENTRY=$(jq -c -n \
               --arg name "$VNAME" \
               --arg bs "$BUILD_SERVER" \
               --arg bf "$BUILD_FRONTEND" \
