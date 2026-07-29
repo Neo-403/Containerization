@@ -11,13 +11,17 @@
 #            4) web_core web 核心镜像   noname:web_core  (仅前端服务, 不内置静态)
 #            5) server  server 镜像     noname:server    (仅联机服务器)
 #        - 用 skopeo 检查各变体镜像是否已在 Docker Hub 存在; 存在则跳过, 除非手动勾选强制构建
-#   2. build 任务 (矩阵, 仅在需要构建的变体上执行):
+#   2. build 任务 (顺序, 而非并行矩阵):
 #        - 下载上游 Release 的 "Source code" 源码包 (GitHub 自动生成的 tar.gz 归档)
 #        - 在构建上下文内动态生成所需的 Dockerfile / .dockerignore / Serve_ZWZW.cjs
 #          (全部由本工作流内嵌 heredoc 写出, 不依赖本仓库或 upstream 自带的文件,
 #           因此 upstream 更新只影响源码内容, 构建/启动逻辑独立可维护)
-#        - 用 docker buildx 从源码原生构建多平台镜像并推送到
-#          Docker Hub 与 GitHub Container Registry
+#        - 用 docker buildx 在「同一台 runner」上逐个变体从源码原生构建多平台镜像并推送:
+#            * 标准镜像(full) / web 变体含静态资源, 体积特别大 -> 推送后立即清理本地
+#              buildx 构建缓存与悬空镜像, 释放磁盘后再构建下一个变体;
+#            * core / web_core / server 不含静态资源 -> 保留本地缓存, 不清理, 构建更快;
+#            * 始终使用 GitHub Actions 缓存 (type=gha) 复用各阶段构建层, 加速后续构建。
+#        - 推送到 Docker Hub 与 GitHub Container Registry
 #
 # 触发方式:
 #   - schedule 定时: 每天 UTC 02:00, 自动构建全部 5 种镜像变体
@@ -227,16 +231,14 @@ jobs:
           fi
 
   # --------------------------------------------------------------------
-  # 任务 2: 下载源码 + 动态生成构建文件 + 矩阵多平台构建并推送
+  # 任务 2: 下载源码 + 动态生成构建文件 + 顺序多平台构建并推送(含静态则清理本地)
   # --------------------------------------------------------------------
   build:
     needs: check
     if: needs.check.result == 'success'
     runs-on: ubuntu-latest
-    # 任一变体失败不影响其余变体
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.check.outputs.matrix) }}
+    # 顺序构建: 在同一 runner 上逐个变体构建->推送->(含静态则清理本地)->下一个,
+    # 避免多个大镜像同时驻留本地磁盘; 循环内对单变体失败做隔离, 不影响其余变体。
     permissions:
       contents: read
       packages: write
@@ -581,13 +583,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 步骤 9: 计算本变体的镜像标签
-      #   标准镜像(full)    : noname:latest + noname:v1.2.3
-      #   其余变体          : noname:<类型>-latest + noname:<类型>-v1.2.3
-      #                       如 core -> noname:core-latest + noname:core-v1.2.3
-      - name: 计算镜像标签
-        id: tags
+      # 步骤 9: 顺序构建并推送各变体镜像
+      #   循环遍历 check 任务规划的变体矩阵, 逐个:
+      #     - 计算本变体标签 (标准=latest+vTag; 其余=<类型>-latest+<类型>-vTag)
+      #     - docker buildx build --push 多平台构建并推送 (gha 缓存加速)
+      #     - 若含静态资源(镜像特别大): 推送后清理本地 buildx 缓存/悬空镜像释放磁盘
+      #     - 若不含静态资源: 保留本地缓存, 不清理 (更快)
+      #   全部变体共用已下载的 build-context 与已生成的 Dockerfile, 仅 build-arg 不同。
+      - name: 顺序构建并推送各变体镜像(含静态镜像构建后清理本地磁盘)
         run: |
+          set +e
           # GHCR/Docker Hub 命名空间必须全小写(bash ${var,,} 转小写, GitHub 表达式无 toLower)
           DH_OWNER="${{ secrets.DOCKERHUB_USERNAME }}"
           GH_OWNER="${{ github.repository_owner }}"
@@ -595,38 +600,72 @@ jobs:
           GH_OWNER="${GH_OWNER,,}"
           DH="${DH_OWNER}/${{ env.IMAGE_NAME }}"
           GH="ghcr.io/${GH_OWNER}/${{ env.IMAGE_NAME }}"
-          VT="${{ matrix.version_tag }}"
-          MT="${{ matrix.mutable_tag }}"
-          {
-            echo "tags<<EOF"
-            echo "$DH:$VT"
-            echo "$DH:$MT"
-            echo "$GH:$VT"
-            echo "$GH:$MT"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "===== 变体 ${{ matrix.variant }} 标签: ====="
-          echo "$DH:$VT"; echo "$DH:$MT"; echo "$GH:$VT"; echo "$GH:$MT"
+          PLATFORMS="${{ env.PLATFORMS }}"
 
-      # 步骤 10: 从源码多平台构建并推送镜像
-      - name: 构建并推送 Docker 镜像 (${{ matrix.variant }})
-        uses: docker/build-push-action@v5
-        with:
-          # 指定构建上下文为我们创建的 build-context 目录
-          context: build-context
-          # 指定 Dockerfile 路径 (由上方步骤动态生成)
-          file: build-context/Dockerfile
-          # 推送到仓库
-          push: true
-          # 使用上一步生成的标签
-          tags: ${{ steps.tags.outputs.tags }}
-          # 要构建的平台, 由 env.PLATFORMS 控制
-          platforms: ${{ env.PLATFORMS }}
-          # 构建开关, 由矩阵按变体注入不同的 build-arg 组合
-          build-args: |
-            BUILD_SERVER=${{ matrix.build_server }}
-            BUILD_FRONTEND=${{ matrix.build_frontend }}
-            BUILD_STATIC=${{ matrix.build_static }}
-          # 使用 GitHub Actions 的缓存来加速构建
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # 解析 check 任务输出的矩阵(include 数组)
+          MATRIX_JSON='${{ needs.check.outputs.matrix }}'
+          if [ -z "$MATRIX_JSON" ]; then
+            echo "未获取到矩阵输出, 构建终止。"
+            exit 1
+          fi
+          mapfile -t ENTRIES < <(echo "$MATRIX_JSON" | jq -c '.include[]')
+
+          if [ "${#ENTRIES[@]}" -eq 0 ]; then
+            echo "没有需要构建的变体, 直接结束。"
+            exit 0
+          fi
+
+          FAILURES=""
+          for entry in "${ENTRIES[@]}"; do
+            VARIANT=$(echo "$entry" | jq -r '.variant')
+            BS=$(echo "$entry" | jq -r '.build_server')
+            BF=$(echo "$entry" | jq -r '.build_frontend')
+            BST=$(echo "$entry" | jq -r '.build_static')
+            MT=$(echo "$entry" | jq -r '.mutable_tag')
+            VT=$(echo "$entry" | jq -r '.version_tag')
+
+            echo "========================================================"
+            echo "▶ 开始构建变体: $VARIANT  (server=$BS frontend=$BF static=$BST)"
+            echo "   标签: $DH:$VT / $DH:$MT / $GH:$VT / $GH:$MT"
+            echo "========================================================"
+
+            # 组装标签参数
+            TAG_ARGS=( -t "$DH:$VT" -t "$DH:$MT" -t "$GH:$VT" -t "$GH:$MT" )
+
+            # 构建并推送(使用 GitHub Actions 缓存 gha 加速; mode=max 缓存全部层)
+            docker buildx build \
+              --platform "$PLATFORMS" \
+              --build-arg "BUILD_SERVER=$BS" \
+              --build-arg "BUILD_FRONTEND=$BF" \
+              --build-arg "BUILD_STATIC=$BST" \
+              --cache-from "type=gha" \
+              --cache-to "type=gha,mode=max" \
+              "${TAG_ARGS[@]}" \
+              --push \
+              build-context
+            rc=$?
+            if [ $rc -ne 0 ]; then
+              echo "✖ 变体 $VARIANT 构建失败 (rc=$rc)"
+              FAILURES="$FAILURES $VARIANT"
+              continue
+            fi
+            echo "✔ 已推送变体 $VARIANT"
+
+            # ---- 磁盘清理: 仅含静态资源(镜像特别大)的变体, 推送后清理本地构建缓存/悬空镜像 ----
+            # 非静态变体复用本地缓存更快, 不清理; gha 缓存在所有情况下均保留供后续变体/运行复用。
+            if [ "$BST" = "true" ]; then
+              echo "🧹 含静态资源, 清理本地 buildx 构建缓存与悬空镜像以释放磁盘..."
+              docker buildx prune -f >/dev/null 2>&1 || true
+              docker image prune -f >/dev/null 2>&1 || true
+            else
+              echo "ℹ 不含静态资源, 保留本地缓存, 跳过清理。"
+            fi
+          done
+
+          if [ -n "$FAILURES" ]; then
+            echo "========================================================"
+            echo "✖ 以下变体构建失败:$FAILURES"
+            echo "========================================================"
+            exit 1
+          fi
+          echo "🎉 全部变体构建并推送完成。"
