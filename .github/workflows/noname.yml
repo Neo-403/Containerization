@@ -108,7 +108,7 @@ jobs:
   # 任务 1: 获取版本 + 规划镜像变体矩阵 + 存在性检查
   # --------------------------------------------------------------------
   check:
-    name: 获取版本 + 规划镜像变体矩阵 + 存在性检查
+    name: 检查是否构建
     runs-on: ubuntu-latest
     # 确保只在自己仓库中运行, 避免 Fork 仓库的无效运行
     if: ${{ github.repository_owner == (vars.NAME || 'Neo-403') }}
@@ -239,7 +239,7 @@ jobs:
   # 任务 2: 下载源码 + 动态生成构建文件 + 顺序多平台构建并推送(含静态则清理本地)
   # --------------------------------------------------------------------
   build:
-    name: 下载源码 + 动态生成构建文件 + 顺序多平台构建并推送
+    name: 多平台构建并推送
     needs: check
     if: needs.check.result == 'success' && needs.check.outputs.build_needed == 'true'
     runs-on: ubuntu-latest
