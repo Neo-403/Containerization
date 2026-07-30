@@ -496,6 +496,13 @@ jobs:
               (pnpm -F ./packages/extension/** build || true) && \
               pnpm --filter @noname/server build
 
+          # 兜底: 上游 @noname/server 的 tsup 可能只打包 src/index.ts(仅导出 createServer),
+          # 不含可执行的 CLI 入口 src/cli.ts, 导致 dist/cli.cjs 缺失、运行时无法启动联机服务器。
+          # 若构建后没有 cli.cjs, 显式把 cli.ts 打包成 dist/cli.cjs (cli.ts 相对导入 createServer, 可独立运行)。
+          RUN if [ "$BUILD_SERVER" = "true" ] && [ ! -f /app/packages/server/dist/cli.cjs ]; then \
+                pnpm --filter @noname/server exec tsup src/cli.ts --format cjs --out-dir dist --no-dts; \
+              fi
+
           # 前端静态服务器 @noname/fs (提炼生产依赖; 未启用则留空目录占位)
           RUN if [ "$BUILD_FRONTEND" = "true" ]; then \
                 pnpm --filter @noname/fs deploy --prod /deploy/fs; \
