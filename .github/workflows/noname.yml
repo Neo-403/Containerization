@@ -12,7 +12,8 @@
 #            5) server  server 镜像     noname:server    (仅联机服务器)
 #        - 用 skopeo 检查各变体镜像是否已在 Docker Hub 存在; 存在则跳过, 除非手动勾选强制构建
 #   2. build 任务 (顺序, 而非并行矩阵):
-#        - 下载上游 Release 的 "Source code" 源码包 (GitHub 自动生成的 tar.gz 归档)
+#        - 克隆上游 libnoname/noname 的 main 分支(浅克隆)作为源码; 不使用 GitHub 的 "Source code"
+#          tar.gz 归档(它会按 .gitattributes 的 export-ignore 丢弃部分文件, 如 packages/server/src/cli.ts)
 #        - 在构建上下文内动态生成所需的 Dockerfile / .dockerignore / Serve_ZWZW.cjs
 #          (全部由本工作流内嵌 heredoc 写出, 不依赖本仓库或 upstream 自带的文件,
 #           因此 upstream 更新只影响源码内容, 构建/启动逻辑独立可维护)
@@ -30,7 +31,7 @@
 #        * build_core     核心镜像     noname:core     (前端+联机, 运行需 -v 挂载 /app/dist)
 #        * build_web      web 镜像     noname:web      (仅前端服务 + 静态)
 #        * build_web_core web 核心镜像 noname:web-core (仅前端服务, 不内置静态)
-#        * build_server   server 镜像  noname:server    (仅联机服务器)
+#        * build_server   联机服务器   noname:server    (仅联机服务器)
 #        勾选哪些就构建哪些; 一个都不勾选则本次不构建任何镜像。
 #        * force_build=true -> 忽略存在性检查, 强制覆盖已存在镜像
 #
@@ -54,7 +55,7 @@ on:
   workflow_dispatch:  # 手动触发
     inputs:
       force_build:  # 是否强制构建并覆盖已有镜像
-        description: '强制构建并覆盖已存在镜像(忽略存在性检查)'
+        description: '强制构建并覆盖已有镜像(忽略存在性检查)'
         type: boolean
         required: false
         default: false  # 默认不覆盖: 仍按镜像是否存在决定是否构建
@@ -210,11 +211,11 @@ jobs:
                 add_variant "$@"
               fi
             }
-            add_if "${{ github.event.inputs.build_full }}"     full     true  true  true  ""        latest
-            add_if "${{ github.event.inputs.build_core }}"     core     true  true  false core      core
-            add_if "${{ github.event.inputs.build_web }}"      web      false true  true  web       web
-            add_if "${{ github.event.inputs.build_web_core }}" web-core false true  false web-core  web-core
-            add_if "${{ github.event.inputs.build_server }}"   server   true  false false server    server
+            add_if "${{ github.event.inputs.build_full }}"      full     true  true  true  ""        latest
+            add_if "${{ github.event.inputs.build_core }}"      core     true  true  false core      core
+            add_if "${{ github.event.inputs.build_web }}"       web      false true  true  web       web
+            add_if "${{ github.event.inputs.build_web_core }}"  web-core false true  false web-core  web-core
+            add_if "${{ github.event.inputs.build_server }}"    server   true  false false server    server
 
             if [ -z "$MATRIX_ENTRIES" ]; then
               echo "⚠ 未勾选任何镜像, 本次不构建任何变体。"
@@ -248,26 +249,24 @@ jobs:
       packages: write
 
     steps:
-      # 步骤 1: 下载上游 Release 的 "Source code" 源码包并解压到 build-context
-      # 即 GitHub 为每个 tag 自动生成的源码归档 (Release 页面的 "Source code (tar.gz)")。
-      - name: 下载上游 Source code 源码包
+      # 步骤 1: 直接克隆上游 main 分支(浅克隆)到 build-context
+      # 注意: 严禁改用 GitHub 的 "Source code" 归档(tar.gz)!
+      # 该归档会遵守 .gitattributes 的 export-ignore, 把部分文件(如 packages/server/src/cli.ts)
+      # 排除在归档外, 导致容器内缺失联机服务器入口; git clone 能拿到完整源码, 与本地测试一致。
+      # 镜像版本号(latest_tag)仍取自上游最新 release, 与源码分支解耦。
+      - name: 克隆上游源码 (main 分支)
         run: |
-          TAG="${{ needs.check.outputs.latest_tag }}"
+          rm -rf build-context
 
-          rm -rf build-context && mkdir -p build-context
-
-          # GitHub 自动生成的源码归档 URL (等价于 Release 资产中的 "Source code (tar.gz)")
-          SRC_URL="https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/archive/refs/tags/${TAG}.tar.gz"
-          echo "下载源码包: $SRC_URL"
-
-          wget -qO- "$SRC_URL" | tar -xz -C build-context --strip-components=1
+          echo "克隆源码: https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }} (branch: main)"
+          git clone --depth 1 --branch main --single-branch "https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}.git" build-context
 
           echo "===== 源码根目录文件: ====="
           ls -la build-context
 
-          # 基本结构校验, 防止上游归档结构变动导致后续构建静默失败
+          # 基本结构校验, 防止上游结构变动导致后续构建静默失败
           if [ ! -f build-context/package.json ]; then
-            echo "错误: 未找到 package.json, 源码包结构异常!"
+            echo "错误: 未找到 package.json, 源码结构异常!"
             exit 1
           fi
 
@@ -496,29 +495,14 @@ jobs:
               (pnpm -F ./packages/extension/** build || true) && \
               pnpm --filter @noname/server build
 
-          # 兜底: 上游 @noname/server 的 tsup 可能只打包 src/index.ts(仅导出 createServer),
-          # 不含可执行的 CLI 入口 src/cli.ts, 导致 dist/cli.cjs 缺失、运行时无法启动联机服务器。
-          # 若构建后没有 cli.cjs, 显式把 cli.ts 打包成 dist/cli.cjs (cli.ts 相对导入 createServer, 可独立运行)。
-          RUN if [ "$BUILD_SERVER" = "true" ] && [ ! -f /app/packages/server/dist/cli.cjs ]; then \
-                pnpm --filter @noname/server exec tsup src/cli.ts --format cjs --out-dir dist --no-dts; \
-              fi
-
           # 前端静态服务器 @noname/fs (提炼生产依赖; 未启用则留空目录占位)
           RUN if [ "$BUILD_FRONTEND" = "true" ]; then \
                 pnpm --filter @noname/fs deploy --prod /deploy/fs; \
-                # 兜底: pnpm deploy 可能按 .gitignore(如 dist) 排除构建产物, 显式补拷
-                if [ ! -f /deploy/fs/dist/index.cjs ] && [ -f /app/packages/fs/dist/index.cjs ]; then \
-                  cp -r /app/packages/fs/dist /deploy/fs/dist; \
-                fi; \
               else mkdir -p /deploy/fs; fi
 
           # 联机服务器 @noname/server (提炼生产依赖; 未启用则留空目录占位)
           RUN if [ "$BUILD_SERVER" = "true" ]; then \
                 pnpm --filter @noname/server deploy --prod /deploy/server; \
-                # 兜底: pnpm deploy 可能按 .gitignore(如 dist) 排除构建产物, 显式补拷
-                if [ ! -f /deploy/server/dist/cli.cjs ] && [ -f /app/packages/server/dist/cli.cjs ]; then \
-                  cp -r /app/packages/server/dist /deploy/server/dist; \
-                fi; \
               else mkdir -p /deploy/server; fi
 
           # 合并 Web 客户端静态资源(默认开启)。完全复刻根 scripts/build.ts 的合并逻辑:
@@ -637,10 +621,9 @@ jobs:
           FAILURES=""
           for entry in "${ENTRIES[@]}"; do
             VARIANT=$(echo "$entry" | jq -r '.variant')
-            # 规范化构建开关: 确保恒为 true/false, 避免空值触发 Dockerfile 的 ARG 默认值(默认 true)导致误包含
-            BS=$(echo "$entry" | jq -r '.build_server // false');   [ -z "$BS" ] && BS=false
-            BF=$(echo "$entry" | jq -r '.build_frontend // false'); [ -z "$BF" ] && BF=false
-            BST=$(echo "$entry" | jq -r '.build_static // false');  [ -z "$BST" ] && BST=false
+            BS=$(echo "$entry" | jq -r '.build_server')
+            BF=$(echo "$entry" | jq -r '.build_frontend')
+            BST=$(echo "$entry" | jq -r '.build_static')
             MT=$(echo "$entry" | jq -r '.mutable_tag')
             VT=$(echo "$entry" | jq -r '.version_tag')
 
@@ -652,76 +635,27 @@ jobs:
             # 组装标签参数
             TAG_ARGS=( -t "$DH:$VT" -t "$DH:$MT" -t "$GH:$VT" -t "$GH:$MT" )
 
-            # 🔥 添加：清理旧缓存
-            echo "🧹 清理 buildx 缓存..."
-            docker buildx prune -f >/dev/null 2>&1 || true
-            
-            # 🔥 添加：验证源码结构
-            echo "🔍 检查源码结构..."
-            ls -la build-context/packages/ | head -20
-            echo "🔍 检查 server 包..."
-            if [ -d "build-context/packages/server" ]; then
-              echo "✅ server 包存在"
-              ls -la build-context/packages/server/
-              cat build-context/packages/server/package.json | jq '.name, .version' || echo "⚠️ 无法读取 package.json"
-            else
-              echo "❌ server 包不存在！这是问题根源！"
-              echo "📦 可用的包："
-              ls -la build-context/packages/
-              exit 1
-            fi
-
-            # 先本地构建(--load, 仅 amd64)并校验关键产物, 通过后再多平台 --push,
-            # 避免把残缺镜像(如 core 缺少联机服务器)推送到仓库。
+            # 构建并推送(使用 GitHub Actions 缓存 gha 加速; mode=max 缓存全部层)
             docker buildx build \
-              --no-cache \
-              --platform linux/amd64 \
-              --build-arg "BUILD_SERVER=$BS" \
-              --build-arg "BUILD_FRONTEND=$BF" \
-              --build-arg "BUILD_STATIC=$BST" \
-              --load \
-              -t temp-verify \
-              build-context
-
-            VERIFY_RC=0
-            if [ "$BS" = "true" ] && ! docker run --rm temp-verify test -f /app/server/dist/cli.cjs; then
-              echo "❌ 变体 $VARIANT 应含联机服务器, 但 /app/server/dist/cli.cjs 缺失!"; VERIFY_RC=1
-            fi
-            if [ "$BF" = "true" ] && ! docker run --rm temp-verify test -f /app/fs/dist/index.cjs; then
-              echo "❌ 变体 $VARIANT 应含前端, 但 /app/fs/dist/index.cjs 缺失!"; VERIFY_RC=1
-            fi
-            if [ "$BST" = "true" ] && ! docker run --rm temp-verify test -f /app/dist/index.html; then
-              echo "❌ 变体 $VARIANT 应含静态资源, 但 /app/dist/index.html 缺失!"; VERIFY_RC=1
-            fi
-
-            docker rmi temp-verify >/dev/null 2>&1 || true
-
-            if [ "$VERIFY_RC" -ne 0 ]; then
-              echo "✖ 变体 $VARIANT 产物校验失败, 跳过推送。"
-              FAILURES="$FAILURES $VARIANT"
-              continue
-            fi
-
-            # 校验通过: 多平台构建并推送
-            docker buildx build \
-              --no-cache \
               --platform "$PLATFORMS" \
               --build-arg "BUILD_SERVER=$BS" \
               --build-arg "BUILD_FRONTEND=$BF" \
               --build-arg "BUILD_STATIC=$BST" \
+              --cache-from "type=gha" \
+              --cache-to "type=gha,mode=max" \
               "${TAG_ARGS[@]}" \
               --push \
               build-context
             rc=$?
             if [ $rc -ne 0 ]; then
-              echo "✖ 变体 $VARIANT 构建/推送失败 (rc=$rc)"
+              echo "✖ 变体 $VARIANT 构建失败 (rc=$rc)"
               FAILURES="$FAILURES $VARIANT"
               continue
             fi
+            echo "✔ 已推送变体 $VARIANT"
 
-            echo "✔ 已推送并验证变体 $VARIANT"
-
-            # ---- 磁盘清理 ----
+            # ---- 磁盘清理: 仅含静态资源(镜像特别大)的变体, 推送后清理本地构建缓存/悬空镜像 ----
+            # 非静态变体复用本地缓存更快, 不清理; gha 缓存在所有情况下均保留供后续变体/运行复用。
             if [ "$BST" = "true" ]; then
               echo "🧹 含静态资源, 清理本地 buildx 构建缓存与悬空镜像以释放磁盘..."
               docker buildx prune -f >/dev/null 2>&1 || true
