@@ -656,14 +656,32 @@ jobs:
             # 组装标签参数
             TAG_ARGS=( -t "$DH:$VT" -t "$DH:$MT" -t "$GH:$VT" -t "$GH:$MT" )
 
-            # 构建并推送(使用 GitHub Actions 缓存 gha 加速; mode=max 缓存全部层)
+            # 🔥 添加：清理旧缓存
+            echo "🧹 清理 buildx 缓存..."
+            docker buildx prune -f >/dev/null 2>&1 || true
+            
+            # 🔥 添加：验证源码结构
+            echo "🔍 检查源码结构..."
+            ls -la build-context/packages/ | head -20
+            echo "🔍 检查 server 包..."
+            if [ -d "build-context/packages/server" ]; then
+              echo "✅ server 包存在"
+              ls -la build-context/packages/server/
+              cat build-context/packages/server/package.json | jq '.name, .version' || echo "⚠️ 无法读取 package.json"
+            else
+              echo "❌ server 包不存在！这是问题根源！"
+              echo "📦 可用的包："
+              ls -la build-context/packages/
+              exit 1
+            fi
+
+            # 构建并推送（禁用缓存以确保完整构建）
             docker buildx build \
+              --no-cache \
               --platform "$PLATFORMS" \
               --build-arg "BUILD_SERVER=$BS" \
               --build-arg "BUILD_FRONTEND=$BF" \
               --build-arg "BUILD_STATIC=$BST" \
-              --cache-from "type=gha" \
-              --cache-to "type=gha,mode=max" \
               "${TAG_ARGS[@]}" \
               --push \
               build-context
@@ -673,10 +691,31 @@ jobs:
               FAILURES="$FAILURES $VARIANT"
               continue
             fi
-            echo "✔ 已推送变体 $VARIANT"
+            
+            # 🔥 添加：验证推送的镜像内容
+            echo "🔍 验证镜像内容（amd64 平台）..."
+            # 临时拉取并检查镜像内容
+            docker buildx build \
+              --no-cache \
+              --platform linux/amd64 \
+              --build-arg "BUILD_SERVER=$BS" \
+              --build-arg "BUILD_FRONTEND=$BF" \
+              --build-arg "BUILD_STATIC=$BST" \
+              --load \
+              -t temp-verify \
+              build-context
+            
+            echo "📦 检查 /app/server/dist/cli.cjs..."
+            docker run --rm temp-verify ls -la /app/server/dist/cli.cjs || echo "❌ server 未找到！"
+            echo "📦 检查环境变量..."
+            docker run --rm temp-verify env | grep ENABLE
+            
+            # 清理临时镜像
+            docker rmi temp-verify >/dev/null 2>&1 || true
+            
+            echo "✔ 已推送并验证变体 $VARIANT"
 
-            # ---- 磁盘清理: 仅含静态资源(镜像特别大)的变体, 推送后清理本地构建缓存/悬空镜像 ----
-            # 非静态变体复用本地缓存更快, 不清理; gha 缓存在所有情况下均保留供后续变体/运行复用。
+            # ---- 磁盘清理 ----
             if [ "$BST" = "true" ]; then
               echo "🧹 含静态资源, 清理本地 buildx 构建缓存与悬空镜像以释放磁盘..."
               docker buildx prune -f >/dev/null 2>&1 || true
