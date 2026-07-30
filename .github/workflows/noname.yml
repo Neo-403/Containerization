@@ -299,7 +299,7 @@ jobs:
           // 不修改任何 dist 产物；日志统一打到 stdout/stderr，便于 docker logs 调试。
           //
           // 参数:
-          //   frontend: APP_PORT(8089) PUBLIC_PORT(80) DIRNAME(/app/dist)
+          //   frontend: APP_PORT(8089) PUBLIC_PORT(80, 特权端口; 非 root 需改或 root 运行) DIRNAME(/app/dist)
           //   server:   SERVER_PORT(8080)
           //   调试:     DEBUG=true -> 开启 fastify 请求日志
 
@@ -381,6 +381,22 @@ jobs:
                   });
                   upstream.on("error", () => client.destroy());
                   client.on("error", () => upstream.destroy());
+                });
+                // 绑定失败的 'error' 必须处理, 否则未捕获事件会直接拖垮整个容器进程
+                // (常见于非 root 用户尝试占用 1024 以下特权端口, 如默认的 PUBLIC_PORT=80)。
+                proxy.on("error", (e) => {
+                  err("frontend", `转发器启动失败 (port=${PUBLIC_PORT}): ${e.code || e.message}`);
+                  if (e.code === "EACCES") {
+                    err(
+                      "frontend",
+                      "当前容器以非 root 运行, 无法绑定特权端口。二选一:\n" +
+                        "  1) 在 docker-compose.yml 中加 user: \"0:0\" 以 root 运行; 或\n" +
+                        "  2) 设置环境变量 PUBLIC_PORT 为非特权端口(如 8088), 并用 ports 映射(如 \"80:8088\")。"
+                    );
+                  } else if (e.code === "EADDRINUSE") {
+                    err("frontend", `端口 ${PUBLIC_PORT} 已被占用。`);
+                  }
+                  return; // 不退出: 联机服务器等其他服务继续运行
                 });
                 proxy.listen(PUBLIC_PORT, "0.0.0.0", () => {
                   out(
@@ -552,12 +568,12 @@ jobs:
           # 统一启动文件(纯 Node 标准库, 不修改任何 dist 产物)
           COPY Serve_ZWZW.cjs /app/Serve_ZWZW.cjs
 
-          # 端口: 80=前端(静态, 0.0.0.0 经转发暴露) 8080=联机(ws)
+          # 端口: 80=前端(静态, 0.0.0.0 经转发暴露, 特权端口! 非 root 需改 PUBLIC_PORT 或 root 运行) 8080=联机(ws)
           EXPOSE 80 8080
 
           # 运行参数(可用 -e 覆盖):
           #   ENABLE_FRONTEND/ENABLE_SERVER(默认跟随 BUILD_*)
-          #   APP_PORT(8089) PUBLIC_PORT(80) DIRNAME(/app/dist) SERVER_PORT(8080) DEBUG(true 开 fastify 日志)
+          #   APP_PORT(8089) PUBLIC_PORT(80, 特权端口) DIRNAME(/app/dist) SERVER_PORT(8080) DEBUG(true 开 fastify 日志)
           # 静态资源挂载示例(未 BUILD_STATIC 时必需):
           #   -v /path/to/dist:/app/dist
           CMD ["node", "/app/Serve_ZWZW.cjs"]
