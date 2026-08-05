@@ -13,16 +13,14 @@
 #     故镜像构建期不预设，运行时由部署方用 -e 传入 (未传则回退容器内部 IP)。
 #
 # 触发方式:
-#   - schedule 定时: 每天 UTC 02:00 自动构建并推送 latest + sha 标签
+#   - schedule 定时: 每天 UTC 02:00 自动构建并推送 latest 标签
 #   - workflow_dispatch 手动: 手动触发构建并推送
 #
 # 多平台: 默认 linux/amd64,linux/arm64 (由 env.PLATFORMS 覆盖)
 #
-# 推送目标 (固定):
-#   - GHCR : ghcr.io/<当前登录账户(运行本 workflow 的仓库 owner)>/<IMAGE_NAME>
-#   - Docker Hub: <DOCKERHUB_USERNAME>/<IMAGE_NAME>
-#       * 需配置 Secrets: DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
-#       * 若未配置该 Secret, 则自动仅推 GHCR (不会报错)
+# 推送目标 (固定推 Docker Hub + GHCR, 均打 latest / <package.json version>):
+#   - Docker Hub : <DOCKERHUB_USERNAME>/<IMAGE_NAME>   (需 Secrets: DOCKERHUB_USERNAME / DOCKERHUB_TOKEN)
+#   - GHCR      : ghcr.io/<运行本 workflow 的仓库 owner>/<IMAGE_NAME>  (用 GITHUB_TOKEN 自动登录)
 #
 # 运行时对外地址 (可选, 运行时 -e 传入, 不传则内网裸 IP+端口):
 #   仅支持主地址(域名根路径), 不做 /项目名 子路径兼容。
@@ -41,24 +39,41 @@
 #   - Secrets (推送 Docker Hub 需要):
 #       DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
 # ==============================================================================
-name: 构建 animal-world-cup Docker 镜像
+name: 构建 animal-world-cup(动物世界杯) 镜像
 
 # ==============================================================================
 # 触发条件
 # ==============================================================================
 on:
   workflow_dispatch:  # 手动触发
-  # schedule:  # 定时触发
+    inputs:
+      tag_version:  # 是否额外打 package.json 中的 version 标签
+        description: '额外打 package.json 中的 version 标签'
+        type: boolean
+        required: false
+        default: true
+  # 定时触发 (如需启用, 取消注释并放到本层级, 与 workflow_dispatch 同级)
+  # schedule:
   #   - cron: '0 2 * * *'
 
 # ==============================================================================
 # 全局环境变量
 # ==============================================================================
 env:
-  SOURCE_REPO: ${{ vars.SOURCE_REPO || 'NeoXu954/animal-world-cup' }}
-  IMAGE_NAME: ${{ vars.IMAGE_NAME || 'animal-world-cup' }}
-  PLATFORMS: ${{ vars.PLATFORMS || 'linux/amd64,linux/arm64' }}
-  SRC_DIR: src
+  # ⭐目标项目所有者(GitHub用户名)
+  UPSTREAM_OWNER: 'NeoXu954'
+  # ⭐目标项目名称(GitHub仓库名)
+  UPSTREAM_REPO: 'animal-world-cup'
+  # ⭐构建的镜像名称(自定义需要构建的镜像名称)
+  IMAGE_NAME: 'animal-world-cup'
+  # ⭐多平台列表: buildx 从源码原生构建, 非本机架构用 QEMU 模拟。
+  #   要增删平台直接改这一行 (如 'linux/amd64,linux/arm64,linux/arm/v7')。
+  PLATFORMS: linux/amd64,linux/arm64
+  # ⭐构建开关: 不再在全局写死, 而是由下方矩阵(check 任务生成的 matrix)按变体注入:
+  #   BUILD_SERVER  是否内置联机服务器 @noname/server
+  #   BUILD_FRONTEND 是否内置前端静态服务 @noname/fs
+  #   BUILD_STATIC  是否内置 Web 静态资源(若 false 需运行时 -v 挂载 /app/dist)
+  #   各变体组合见 check 任务中的 VARIANTS 定义。
 
 # ==============================================================================
 # 任务定义
@@ -73,22 +88,30 @@ jobs:
 
     steps:
       # 1. 检出目标仓库源码 (到 src/ 子目录, 作为构建上下文)
-      - name: 检出源码
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          path: ${{ env.SRC_DIR }}
-          # 公开仓库默认可读; 若是私有仓库请配置 PAT 到 SOURCE_PAT Secret 并启用下行
-          # token: ${{ secrets.SOURCE_PAT }}
+      - name: 克隆上游源码 (main 分支)
+        run: |
+          rm -rf build-context
 
-      # 2. 生成构建文件 (临时创建于 src/ 内, 不污染源仓库)
+          echo "克隆源码: https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }} (branch: main)"
+          git clone --depth 1 --branch main --single-branch "https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}.git" build-context
+
+          echo "===== 源码根目录文件: ====="
+          ls -la build-context
+
+          # 基本结构校验, 防止上游结构变动导致后续构建静默失败
+          if [ ! -f build-context/package.json ]; then
+            echo "错误: 未找到 package.json, 源码结构异常!"
+            exit 1
+          fi
+
+      # 2. 生成构建文件 (临时创建于 build-context/ 内, 不污染源仓库)
       - name: 生成构建文件
         run: |
           set -e
-          cd "$SRC_DIR"
+          # 统一使用 build-context/ 作为上下文与生成文件目录
 
           # 2.1 Dockerfile
-          cat > Dockerfile << 'DOCKEREOF'
+          cat > build-context/Dockerfile << 'DOCKEREOF'
           # syntax=docker/dockerfile:1
           # ----------------------------------------------------------------------------
           # animal-world-cup — multi-stage Docker build (由 CI 动态生成)
@@ -170,7 +193,7 @@ jobs:
           DOCKEREOF
 
           # 2.2 .dockerignore (位于构建上下文根, 即 src/)
-          cat > .dockerignore << 'IGNOREEOF'
+          cat > build-context/.dockerignore << 'IGNOREEOF'
           node_modules
           .next
           .open-next
@@ -185,7 +208,7 @@ jobs:
 
           # 2.3 docker/start.mjs (容器启动器, 同时拉起 Web 与 LAN relay)
           mkdir -p docker
-          cat > docker/start.mjs << 'STARTEOF'
+          cat > build-context/docker/start.mjs << 'STARTEOF'
           // 容器入口 (由 CI 动态生成). 同时拉起:
           //   1) Next.js Web 服务 (next start -p WEB_PORT)
           //   2) 局域网对战 relay (script/lan-server.mjs, 监听 LAN_PORT)
@@ -234,82 +257,56 @@ jobs:
           STARTEOF
 
           echo "=== 已生成构建文件 ==="
-          ls -la Dockerfile .dockerignore docker/start.mjs
+          ls -la build-context/Dockerfile build-context/.dockerignore build-context/docker/start.mjs
 
-      # 3. 计算推送目标 (if 表达式不能用 secrets, 故在此预计算 Docker Hub 是否可用)
-      - name: 计算推送目标
-        id: targets
-        env:
-          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
-        run: |
-          if [ -n "$DH_USER" ]; then
-            echo "dh_enabled=true" >> "$GITHUB_OUTPUT"
-            echo "dh_image=$DH_USER/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "dh_enabled=false" >> "$GITHUB_OUTPUT"
-            echo "dh_image=" >> "$GITHUB_OUTPUT"
-          fi
-
-      # 4. 设置 QEMU (跨架构构建)
+      # 设置 QEMU (跨架构构建)
       - name: 设置 QEMU
         uses: docker/setup-qemu-action@v3
 
-      # 5. 设置 Docker Buildx
+      # 设置 Docker Buildx
       - name: 设置 Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 6. 登录 GitHub Container Registry (内置令牌, 无需额外配置)
-      - name: 登录 GHCR
+      # 登录到 Docker Hub (固定推送目标之一)
+      - name: 登录到 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 登录到 GitHub Container Registry (固定推送目标之二)
+      - name: 登录到 GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 7. (可选) 登录 Docker Hub — 仅在已配置 Secret 时
-      - name: 登录 Docker Hub
-        if: ${{ steps.targets.outputs.dh_enabled == 'true' }}
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # 8. 读取 package.json version (供 version 标签使用)
+      # 读取 package.json version (供 version 标签使用)
       - name: 读取版本号
         id: version
         run: |
-          VERSION=$(node -p "require('./${{ env.SRC_DIR }}/package.json').version")
+          VERSION=$(node -p "require('./build-context/package.json').version")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "package.json version = $VERSION"
-
-      # 9. 提取元数据 / 标签
-      - name: 提取镜像标签
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
-            ${{ steps.targets.outputs.dh_enabled == 'true' && steps.targets.outputs.dh_image || '' }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-,format=short
-            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }}
-          flavor: |
-            latest=false
 
       # 10. 构建并推送 (使用 src/ 下生成的 Dockerfile 与 .dockerignore)
       - name: 构建并推送镜像
         uses: docker/build-push-action@v6
         with:
-          context: ${{ env.SRC_DIR }}
-          file: ${{ env.SRC_DIR }}/Dockerfile
+          context: build-context
+          file: build-context/Dockerfile
           platforms: ${{ env.PLATFORMS }}
           push: true
           # 关闭 build provenance/attestation: 多平台镜像会额外推送 attestation
-          # manifest, 短时间内大量请求易触发 GHCR 二级速率限制(403 secondary rate limit)
+          # manifest, 短时间内大量请求易触发注册表二级速率限制
           provenance: false
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          # 固定推送 Docker Hub + GHCR, 标签: latest / <package.json version>
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
@@ -320,9 +317,9 @@ jobs:
         run: |
           echo "### 构建完成 🎉" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "源仓库: \`${{ env.SOURCE_REPO }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "镜像: \`${{ env.IMAGE_NAME }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "源仓库: \`${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "镜像: \`${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}\` 与 \`ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "平台: \`${{ env.PLATFORMS }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "标签:" >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.meta.outputs.tags }}" | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
+          echo "- :latest / :${{ steps.version.outputs.version }} (Docker Hub + GHCR)" >> "$GITHUB_STEP_SUMMARY"
