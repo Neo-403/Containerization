@@ -46,12 +46,6 @@ name: 构建 animal-world-cup(动物世界杯) 镜像
 # ==============================================================================
 on:
   workflow_dispatch:  # 手动触发
-    inputs:
-      tag_version:  # 是否额外打 package.json 中的 version 标签
-        description: '额外打 package.json 中的 version 标签'
-        type: boolean
-        required: false
-        default: true
   # 定时触发 (如需启用, 取消注释并放到本层级, 与 workflow_dispatch 同级)
   # schedule:
   #   - cron: '0 2 * * *'
@@ -207,7 +201,7 @@ jobs:
           IGNOREEOF
 
           # 2.3 docker/start.mjs (容器启动器, 同时拉起 Web 与 LAN relay)
-          mkdir -p docker
+          mkdir -p build-context/docker
           cat > build-context/docker/start.mjs << 'STARTEOF'
           // 容器入口 (由 CI 动态生成). 同时拉起:
           //   1) Next.js Web 服务 (next start -p WEB_PORT)
