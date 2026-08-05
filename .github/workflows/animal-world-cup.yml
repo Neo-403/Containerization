@@ -5,6 +5,8 @@
 #   - 本工作流不依赖仓库内预置的 Docker 文件。构建所需三个文件
 #     (Dockerfile / .dockerignore / docker/start.mjs) 全部在 Actions 内
 #     临时生成 (见 "生成构建文件" 步骤)，构建结束即弃，仓库源码保持干净。
+#   - 源码来自另一个仓库 SOURCE_REPO (默认 NeoXu954/animal-world-cup)，
+#     checkout 到 src/ 子目录，构建上下文即为 src/。
 #   - 构建产物为单镜像。局域网对战依赖 WebSocket relay (script/lan-server.mjs)，
 #     由生成的 docker/start.mjs 同时拉起 Web 与 relay。
 #   - relay 的对外可达 IP 通过 LAN_PUBLIC_HOST 注入；该值在 CI 中无法确定，
@@ -13,18 +15,23 @@
 # 触发方式:
 #   - schedule 定时: 每天 UTC 02:00 自动构建并推送 latest + sha 标签
 #   - workflow_dispatch 手动:
-#       * push_dockerhub: 是否额外推送到 Docker Hub (需配置对应 Secrets)
-#       * tag_version:    是否额外打 package.json 里的 version 标签
+#       * tag_version: 是否额外打 package.json 里的 version 标签
 #
 # 多平台: 默认 linux/amd64,linux/arm64 (由 env.PLATFORMS 覆盖)
 #
+# 推送目标 (固定):
+#   - GHCR : ghcr.io/<SOURCE_REPO owner>/<IMAGE_NAME>
+#   - Docker Hub: <DOCKERHUB_USERNAME>/<IMAGE_NAME>
+#       * 需配置 Secrets: DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+#       * 若未配置该 Secret, 则自动仅推 GHCR (不会报错)
+#
 # 配置方法 (Settings → Secrets and variables → Actions):
 #   - Variables (可选):
-#       IMAGE_NAME  镜像名, 默认 animal-world-cup
-#       PLATFORMS   目标平台, 默认 linux/amd64,linux/arm64
-#   - Secrets (可选, 仅当要推 Docker Hub):
+#       SOURCE_REPO  源仓库, 默认 NeoXu954/animal-world-cup
+#       IMAGE_NAME   镜像名, 默认 animal-world-cup
+#       PLATFORMS    目标平台, 默认 linux/amd64,linux/arm64
+#   - Secrets (推送 Docker Hub 需要):
 #       DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
-#   GHCR 推送使用内置 GITHUB_TOKEN，无需额外配置。
 # ==============================================================================
 name: 构建 animal-world-cup Docker 镜像
 
@@ -34,11 +41,6 @@ name: 构建 animal-world-cup Docker 镜像
 on:
   workflow_dispatch:  # 手动触发
     inputs:
-      push_dockerhub:  # 是否额外推送 Docker Hub
-        description: '额外推送到 Docker Hub (需配置 DOCKERHUB_USERNAME/TOKEN)'
-        type: boolean
-        required: false
-        default: false
       tag_version:  # 是否额外打 version 标签
         description: '额外打 package.json 中的 version 标签'
         type: boolean
@@ -51,8 +53,10 @@ on:
 # 全局环境变量
 # ==============================================================================
 env:
+  SOURCE_REPO: ${{ vars.SOURCE_REPO || 'NeoXu954/animal-world-cup' }}
   IMAGE_NAME: ${{ vars.IMAGE_NAME || 'animal-world-cup' }}
   PLATFORMS: ${{ vars.PLATFORMS || 'linux/amd64,linux/arm64' }}
+  SRC_DIR: src
 
 # ==============================================================================
 # 任务定义
@@ -66,14 +70,20 @@ jobs:
       packages: write
 
     steps:
-      # 1. 检出源码
+      # 1. 检出目标仓库源码 (到 src/ 子目录, 作为构建上下文)
       - name: 检出源码
         uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          path: ${{ env.SRC_DIR }}
+          # 公开仓库默认可读; 若是私有仓库请配置 PAT 到 SOURCE_PAT Secret 并启用下行
+          # token: ${{ secrets.SOURCE_PAT }}
 
-      # 2. 生成构建文件 (临时创建, 不污染源码仓库)
+      # 2. 生成构建文件 (临时创建于 src/ 内, 不污染源仓库)
       - name: 生成构建文件
         run: |
           set -e
+          cd "$SRC_DIR"
 
           # 2.1 Dockerfile
           cat > Dockerfile << 'DOCKEREOF'
@@ -148,7 +158,7 @@ jobs:
           CMD ["node", "docker/start.mjs"]
           DOCKEREOF
 
-          # 2.2 .dockerignore
+          # 2.2 .dockerignore (位于构建上下文根, 即 src/)
           cat > .dockerignore << 'IGNOREEOF'
           node_modules
           .next
@@ -212,6 +222,9 @@ jobs:
             echo "dh_enabled=false" >> "$GITHUB_OUTPUT"
             echo "dh_image=" >> "$GITHUB_OUTPUT"
           fi
+          # 源仓库 owner (用于 GHCR 镜像名)
+          SRC_OWNER="${SOURCE_REPO%%/*}"
+          echo "src_owner=$SRC_OWNER" >> "$GITHUB_OUTPUT"
 
       # 4. 设置 QEMU (跨架构构建)
       - name: 设置 QEMU
@@ -229,21 +242,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 7. (可选) 登录 Docker Hub — 仅在勾选且已配置 Secret 时
+      # 7. (可选) 登录 Docker Hub — 仅在已配置 Secret 时
       - name: 登录 Docker Hub
-        if: ${{ github.event.inputs.push_dockerhub == 'true' && steps.targets.outputs.dh_enabled == 'true' }}
+        if: ${{ steps.targets.outputs.dh_enabled == 'true' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # 8. 提取元数据 / 标签
+      # 8. 读取 package.json version (供 version 标签使用)
+      - name: 读取版本号
+        id: version
+        if: ${{ github.event.inputs.tag_version != 'false' }}
+        run: |
+          VERSION=$(node -p "require('./${{ env.SRC_DIR }}/package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "package.json version = $VERSION"
+
+      # 9. 提取元数据 / 标签
       - name: 提取镜像标签
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+            ghcr.io/${{ steps.targets.outputs.src_owner }}/${{ env.IMAGE_NAME }}
             ${{ steps.targets.outputs.dh_enabled == 'true' && steps.targets.outputs.dh_image || '' }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
@@ -252,21 +274,12 @@ jobs:
           flavor: |
             latest=false
 
-      # 9. 读取 package.json version (供 version 标签使用)
-      - name: 读取版本号
-        id: version
-        if: ${{ github.event.inputs.tag_version != 'false' }}
-        run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "package.json version = $VERSION"
-
-      # 10. 构建并推送 (使用上一步生成的 Dockerfile 与 .dockerignore)
+      # 10. 构建并推送 (使用 src/ 下生成的 Dockerfile 与 .dockerignore)
       - name: 构建并推送镜像
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ./Dockerfile
+          context: ${{ env.SRC_DIR }}
+          file: ${{ env.SRC_DIR }}/Dockerfile
           platforms: ${{ env.PLATFORMS }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -281,6 +294,7 @@ jobs:
         run: |
           echo "### 构建完成 🎉" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "源仓库: \`${{ env.SOURCE_REPO }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "镜像: \`${{ env.IMAGE_NAME }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "平台: \`${{ env.PLATFORMS }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
