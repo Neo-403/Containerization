@@ -199,15 +199,29 @@ jobs:
           echo "=== 已生成构建文件 ==="
           ls -la Dockerfile .dockerignore docker/start.mjs
 
-      # 3. 设置 QEMU (跨架构构建)
+      # 3. 计算推送目标 (if 表达式不能用 secrets, 故在此预计算 Docker Hub 是否可用)
+      - name: 计算推送目标
+        id: targets
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          if [ -n "$DH_USER" ]; then
+            echo "dh_enabled=true" >> "$GITHUB_OUTPUT"
+            echo "dh_image=$DH_USER/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "dh_enabled=false" >> "$GITHUB_OUTPUT"
+            echo "dh_image=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 4. 设置 QEMU (跨架构构建)
       - name: 设置 QEMU
         uses: docker/setup-qemu-action@v3
 
-      # 4. 设置 Docker Buildx
+      # 5. 设置 Docker Buildx
       - name: 设置 Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 5. 登录 GitHub Container Registry (内置令牌, 无需额外配置)
+      # 6. 登录 GitHub Container Registry (内置令牌, 无需额外配置)
       - name: 登录 GHCR
         uses: docker/login-action@v3
         with:
@@ -215,22 +229,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 6. (可选) 登录 Docker Hub
+      # 7. (可选) 登录 Docker Hub — 仅在勾选且已配置 Secret 时
       - name: 登录 Docker Hub
-        if: ${{ github.event.inputs.push_dockerhub == 'true' && secrets.DOCKERHUB_USERNAME != '' }}
+        if: ${{ github.event.inputs.push_dockerhub == 'true' && steps.targets.outputs.dh_enabled == 'true' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # 7. 提取元数据 / 标签
+      # 8. 提取元数据 / 标签
       - name: 提取镜像标签
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
-            ${{ (github.event.inputs.push_dockerhub == 'true' && secrets.DOCKERHUB_USERNAME != '') && format('{0}/{1}', secrets.DOCKERHUB_USERNAME, env.IMAGE_NAME) || '' }}
+            ${{ steps.targets.outputs.dh_enabled == 'true' && steps.targets.outputs.dh_image || '' }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-,format=short
@@ -238,7 +252,7 @@ jobs:
           flavor: |
             latest=false
 
-      # 8. 读取 package.json version (供 version 标签使用)
+      # 9. 读取 package.json version (供 version 标签使用)
       - name: 读取版本号
         id: version
         if: ${{ github.event.inputs.tag_version != 'false' }}
@@ -247,7 +261,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "package.json version = $VERSION"
 
-      # 9. 构建并推送 (使用上一步生成的 Dockerfile 与 .dockerignore)
+      # 10. 构建并推送 (使用上一步生成的 Dockerfile 与 .dockerignore)
       - name: 构建并推送镜像
         uses: docker/build-push-action@v6
         with:
@@ -262,7 +276,7 @@ jobs:
           build-args: |
             SKIP_SW_STAMP=false
 
-      # 10. 汇总
+      # 11. 汇总
       - name: 构建摘要
         run: |
           echo "### 构建完成 🎉" >> "$GITHUB_STEP_SUMMARY"
