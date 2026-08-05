@@ -14,8 +14,7 @@
 #
 # 触发方式:
 #   - schedule 定时: 每天 UTC 02:00 自动构建并推送 latest + sha 标签
-#   - workflow_dispatch 手动:
-#       * tag_version: 是否额外打 package.json 里的 version 标签
+#   - workflow_dispatch 手动: 手动触发构建并推送
 #
 # 多平台: 默认 linux/amd64,linux/arm64 (由 env.PLATFORMS 覆盖)
 #
@@ -49,14 +48,8 @@ name: 构建 animal-world-cup Docker 镜像
 # ==============================================================================
 on:
   workflow_dispatch:  # 手动触发
-    inputs:
-      tag_version:  # 是否额外打 version 标签
-        description: '额外打 package.json 中的 version 标签'
-        type: boolean
-        required: false
-        default: true
-  schedule:  # 定时触发
-    - cron: '0 2 * * *'
+  # schedule:  # 定时触发
+  #   - cron: '0 2 * * *'
 
 # ==============================================================================
 # 全局环境变量
@@ -284,7 +277,6 @@ jobs:
       # 8. 读取 package.json version (供 version 标签使用)
       - name: 读取版本号
         id: version
-        if: ${{ github.event.inputs.tag_version != 'false' }}
         run: |
           VERSION=$(node -p "require('./${{ env.SRC_DIR }}/package.json').version")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -301,7 +293,7 @@ jobs:
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-,format=short
-            type=semver,pattern={{version}},enable=${{ github.event.inputs.tag_version != 'false' }},value=${{ steps.version.outputs.version }}
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }}
           flavor: |
             latest=false
 
@@ -313,6 +305,9 @@ jobs:
           file: ${{ env.SRC_DIR }}/Dockerfile
           platforms: ${{ env.PLATFORMS }}
           push: true
+          # 关闭 build provenance/attestation: 多平台镜像会额外推送 attestation
+          # manifest, 短时间内大量请求易触发 GHCR 二级速率限制(403 secondary rate limit)
+          provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
