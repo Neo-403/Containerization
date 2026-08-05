@@ -20,10 +20,19 @@
 # 多平台: 默认 linux/amd64,linux/arm64 (由 env.PLATFORMS 覆盖)
 #
 # 推送目标 (固定):
-#   - GHCR : ghcr.io/<SOURCE_REPO owner>/<IMAGE_NAME>
+#   - GHCR : ghcr.io/<当前登录账户(运行本 workflow 的仓库 owner)>/<IMAGE_NAME>
 #   - Docker Hub: <DOCKERHUB_USERNAME>/<IMAGE_NAME>
 #       * 需配置 Secrets: DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
 #       * 若未配置该 Secret, 则自动仅推 GHCR (不会报错)
+#
+# 运行时对外地址 (可选, 运行时 -e 传入, 不传则内网裸 IP+端口):
+#   仅支持主地址(域名根路径), 不做 /项目名 子路径兼容。
+#   - LAN_WS_URL    手机连的 WebSocket 完整地址。
+#       例: wss://域名/ws  (nginx 合并端口, WS 挂在 /ws)
+#           ws://192.168.1.5:13001  (内网裸部署, 等价默认)
+#   - WEB_PUBLIC_URL Web 对外基址(https 主地址), 用于二维码/pad 链接。
+#       例: https://域名
+#   - LAN_PUBLIC_HOST relay 回退用的对外 IP (无反代时填宿主机 LAN IP)。
 #
 # 配置方法 (Settings → Secrets and variables → Actions):
 #   - Variables (可选):
@@ -128,6 +137,15 @@ jobs:
           # patch: 让 relay 优先使用 LAN_PUBLIC_HOST 作为对外可达 IP
           RUN node -e 'const fs=require("fs");const f="script/lan-server.mjs";let s=fs.readFileSync(f,"utf8");s=s.replace("ip: lanIP()","ip: process.env.LAN_PUBLIC_HOST||lanIP()");s=s.replace("const ip = lanIP();","const ip = process.env.LAN_PUBLIC_HOST||lanIP()");fs.writeFileSync(f,s);console.log("[patch] lan-server 现已支持 LAN_PUBLIC_HOST");'
 
+          # patch: 前端 WebSocket 地址支持运行时变量 __LAN_WS_URL (反代/子路径/wss 场景)
+          RUN node -e 'const fs=require("fs");const f="app/lan/lanClient.js";let s=fs.readFileSync(f,"utf8");s=s.replace("return `ws://${host}:${LAN_PORT}`;","if(window.__LAN_WS_URL)return window.__LAN_WS_URL;\n  return `ws://${host}:${LAN_PORT}`;");fs.writeFileSync(f,s);console.log("[patch] lanClient 现已支持 __LAN_WS_URL");'
+
+          # patch: 大屏二维码/pad 链接支持运行时变量 __WEB_PUBLIC_URL (https/子路径场景)
+          RUN node -e 'const fs=require("fs");const f="app/lobby/LobbyClient.jsx";let s=fs.readFileSync(f,"utf8");s=s.replace("const url = `http://${msg.ip}:${msg.port}/pad?room=${msg.room}`;","const base=(typeof window!==\"undefined\"&&window.__WEB_PUBLIC_URL)?window.__WEB_PUBLIC_URL.replace(/\\/+$/,\"\"):`http://${msg.ip}:${msg.port}`;\n          const url = `${base}/pad?room=${msg.room}`;");fs.writeFileSync(f,s);console.log("[patch] LobbyClient 现已支持 __WEB_PUBLIC_URL");'
+
+          # patch: layout 引入运行时配置脚本 /lan-runtime.js (由 docker/start.mjs 在运行时生成)
+          RUN node -e 'const fs=require("fs");const f="app/layout.jsx";let s=fs.readFileSync(f,"utf8");s=s.replace("</head>","    <script src=\"/lan-runtime.js\" defer></script>\n      </head>");fs.writeFileSync(f,s);console.log("[patch] layout 已引入 lan-runtime.js");'
+
           # ---- Stage 3: 运行时 -------------------------------------------------------
           FROM node:20-alpine AS runner
           WORKDIR /app
@@ -181,10 +199,26 @@ jobs:
           // 局域网联机的二维码/房间号由 relay 生成; relay 对外 IP 通过
           // LAN_PUBLIC_HOST 注入 (patch 后的 lan-server.mjs 会优先用它),
           // 否则回退容器内部 IP (Docker 桥接网下手机访问不到, 需 host 网络或显式传入)。
+          //
+          // 前端对外地址 (WebSocket / pad 链接) 通过两个运行时变量控制:
+          //   LAN_WS_URL    手机连的 WebSocket 完整地址, 如 wss://域名/ws、ws://IP:13001
+          //   WEB_PUBLIC_URL Web 对外基址(可含 https 与子路径), 如 https://域名、https://域名/项目名
+          // 未设置时前端回退到内网裸 IP+端口的默认行为。
           import { spawn } from "node:child_process";
+          import { writeFileSync, mkdirSync } from "node:fs";
 
           const WEB_PORT = String(process.env.WEB_PORT || 13000);
           const LAN_PORT = String(process.env.LAN_PORT || 13001);
+
+          // 运行时生成前端运行时配置 (不修改镜像内源码, 仅写入 public/ 静态目录)
+          const wsUrl = (process.env.LAN_WS_URL || "").trim();
+          const webUrl = (process.env.WEB_PUBLIC_URL || "").trim();
+          const cfg = [];
+          if (wsUrl) cfg.push(`window.__LAN_WS_URL=${JSON.stringify(wsUrl)};`);
+          if (webUrl) cfg.push(`window.__WEB_PUBLIC_URL=${JSON.stringify(webUrl)};`);
+          mkdirSync("public", { recursive: true });
+          writeFileSync("public/lan-runtime.js", cfg.join("\n") + "\n");
+          console.log(`[start] lan-runtime.js -> ${cfg.length ? "已注入自定义对外地址" : "空 (使用内网 IP+端口 默认行为)"}`);
 
           console.log(`[start] web  -> :${WEB_PORT}   relay -> :${LAN_PORT}`);
           console.log(`[start] LAN_PUBLIC_HOST=${process.env.LAN_PUBLIC_HOST || "(unset -> 容器内部IP)"}`);
@@ -222,9 +256,6 @@ jobs:
             echo "dh_enabled=false" >> "$GITHUB_OUTPUT"
             echo "dh_image=" >> "$GITHUB_OUTPUT"
           fi
-          # 源仓库 owner (用于 GHCR 镜像名)
-          SRC_OWNER="${SOURCE_REPO%%/*}"
-          echo "src_owner=$SRC_OWNER" >> "$GITHUB_OUTPUT"
 
       # 4. 设置 QEMU (跨架构构建)
       - name: 设置 QEMU
@@ -265,7 +296,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ghcr.io/${{ steps.targets.outputs.src_owner }}/${{ env.IMAGE_NAME }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
             ${{ steps.targets.outputs.dh_enabled == 'true' && steps.targets.outputs.dh_image || '' }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
