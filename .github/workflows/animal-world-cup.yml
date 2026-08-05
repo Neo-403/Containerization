@@ -1,0 +1,274 @@
+# ==============================================================================
+# 工作流名称: 构建 animal-world-cup Docker 镜像
+#
+# 说明:
+#   - 本工作流不依赖仓库内预置的 Docker 文件。构建所需三个文件
+#     (Dockerfile / .dockerignore / docker/start.mjs) 全部在 Actions 内
+#     临时生成 (见 "生成构建文件" 步骤)，构建结束即弃，仓库源码保持干净。
+#   - 构建产物为单镜像。局域网对战依赖 WebSocket relay (script/lan-server.mjs)，
+#     由生成的 docker/start.mjs 同时拉起 Web 与 relay。
+#   - relay 的对外可达 IP 通过 LAN_PUBLIC_HOST 注入；该值在 CI 中无法确定，
+#     故镜像构建期不预设，运行时由部署方用 -e 传入 (未传则回退容器内部 IP)。
+#
+# 触发方式:
+#   - schedule 定时: 每天 UTC 02:00 自动构建并推送 latest + sha 标签
+#   - workflow_dispatch 手动:
+#       * push_dockerhub: 是否额外推送到 Docker Hub (需配置对应 Secrets)
+#       * tag_version:    是否额外打 package.json 里的 version 标签
+#
+# 多平台: 默认 linux/amd64,linux/arm64 (由 env.PLATFORMS 覆盖)
+#
+# 配置方法 (Settings → Secrets and variables → Actions):
+#   - Variables (可选):
+#       IMAGE_NAME  镜像名, 默认 animal-world-cup
+#       PLATFORMS   目标平台, 默认 linux/amd64,linux/arm64
+#   - Secrets (可选, 仅当要推 Docker Hub):
+#       DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+#   GHCR 推送使用内置 GITHUB_TOKEN，无需额外配置。
+# ==============================================================================
+name: 构建 animal-world-cup Docker 镜像
+
+# ==============================================================================
+# 触发条件
+# ==============================================================================
+on:
+  workflow_dispatch:  # 手动触发
+    inputs:
+      push_dockerhub:  # 是否额外推送 Docker Hub
+        description: '额外推送到 Docker Hub (需配置 DOCKERHUB_USERNAME/TOKEN)'
+        type: boolean
+        required: false
+        default: false
+      tag_version:  # 是否额外打 version 标签
+        description: '额外打 package.json 中的 version 标签'
+        type: boolean
+        required: false
+        default: true
+  schedule:  # 定时触发
+    - cron: '0 2 * * *'
+
+# ==============================================================================
+# 全局环境变量
+# ==============================================================================
+env:
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || 'animal-world-cup' }}
+  PLATFORMS: ${{ vars.PLATFORMS || 'linux/amd64,linux/arm64' }}
+
+# ==============================================================================
+# 任务定义
+# ==============================================================================
+jobs:
+  build:
+    name: 多平台构建并推送
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 1. 检出源码
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      # 2. 生成构建文件 (临时创建, 不污染源码仓库)
+      - name: 生成构建文件
+        run: |
+          set -e
+
+          # 2.1 Dockerfile
+          cat > Dockerfile << 'DOCKEREOF'
+          # syntax=docker/dockerfile:1
+          # ----------------------------------------------------------------------------
+          # animal-world-cup — multi-stage Docker build (由 CI 动态生成)
+          #
+          # 约束:
+          #   * 不修改宿主机源码。对源码的"改动"都在镜像副本内完成 (构建期 patch)。
+          #   * 局域网对战需要 WebSocket relay (script/lan-server.mjs) 与 Web 同时运行。
+          #   * 二维码/房间号由 relay 生成，其对外 IP 通过 LAN_PUBLIC_HOST 注入。
+          # ----------------------------------------------------------------------------
+
+          # ---- Stage 1: 依赖安装 -----------------------------------------------------
+          FROM node:20-alpine AS deps
+          ENV PNPM_HOME=/usr/local/pnpm
+          ENV PATH=$PNPM_HOME:$PATH
+          RUN npm install -g pnpm@9
+          WORKDIR /app
+
+          COPY package.json pnpm-lock.yaml ./
+          COPY next.config.mjs open-next.config.ts jsconfig.json ./
+          RUN --mount=type=cache,target=/usr/local/pnpm/store \
+              pnpm install --frozen-lockfile
+
+          # ---- Stage 2: 构建 ---------------------------------------------------------
+          FROM deps AS builder
+          WORKDIR /app
+          COPY . .
+
+          ENV NEXT_TELEMETRY_DISABLED=1
+          ENV NODE_ENV=production
+
+          ARG SKIP_SW_STAMP=false
+          RUN if [ "$SKIP_SW_STAMP" = "true" ]; then \
+                echo "[build] SKIP_SW_STAMP=true, 跳过 sw.js 版本戳"; \
+              else \
+                node script/stamp-sw-version.mjs; \
+              fi
+          RUN node script/safe-build.mjs
+
+          # patch: 让 relay 优先使用 LAN_PUBLIC_HOST 作为对外可达 IP
+          RUN node -e 'const fs=require("fs");const f="script/lan-server.mjs";let s=fs.readFileSync(f,"utf8");s=s.replace("ip: lanIP()","ip: process.env.LAN_PUBLIC_HOST||lanIP()");s=s.replace("const ip = lanIP();","const ip = process.env.LAN_PUBLIC_HOST||lanIP()");fs.writeFileSync(f,s);console.log("[patch] lan-server 现已支持 LAN_PUBLIC_HOST");'
+
+          # ---- Stage 3: 运行时 -------------------------------------------------------
+          FROM node:20-alpine AS runner
+          WORKDIR /app
+          ENV NODE_ENV=production
+          ENV NEXT_TELEMETRY_DISABLED=1
+          ENV WEB_PORT=13000
+          ENV LAN_PORT=13001
+          ENV ENABLE_LAN_RELAY=true
+
+          RUN addgroup --system --gid 1001 nodejs \
+           && adduser  --system --uid 1001 nextjs
+
+          COPY --from=deps --chown=nextjs:nodejs /app/node_modules ./node_modules
+          COPY --from=builder --chown=nextjs:nodejs /app/.next ./.next
+          COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+          COPY --from=builder --chown=nextjs:nodejs /app/next.config.mjs ./next.config.mjs
+          COPY --from=builder --chown=nextjs:nodejs /app/package.json ./package.json
+          COPY --from=builder --chown=nextjs:nodejs /app/script/lan-server.mjs ./script/lan-server.mjs
+          COPY --from=builder --chown=nextjs:nodejs /app/docker/start.mjs ./docker/start.mjs
+
+          USER nextjs
+
+          EXPOSE 13000 13001
+
+          HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+            CMD wget -qO- http://127.0.0.1:13000/ >/dev/null 2>&1 || exit 1
+
+          CMD ["node", "docker/start.mjs"]
+          DOCKEREOF
+
+          # 2.2 .dockerignore
+          cat > .dockerignore << 'IGNOREEOF'
+          node_modules
+          .next
+          .open-next
+          .cloudflare
+          .codebuddy
+          .git
+          .gitignore
+          *.log
+          npm-debug.log*
+          .DS_Store
+          IGNOREEOF
+
+          # 2.3 docker/start.mjs (容器启动器, 同时拉起 Web 与 LAN relay)
+          mkdir -p docker
+          cat > docker/start.mjs << 'STARTEOF'
+          // 容器入口 (由 CI 动态生成). 同时拉起:
+          //   1) Next.js Web 服务 (next start -p WEB_PORT)
+          //   2) 局域网对战 relay (script/lan-server.mjs, 监听 LAN_PORT)
+          // 局域网联机的二维码/房间号由 relay 生成; relay 对外 IP 通过
+          // LAN_PUBLIC_HOST 注入 (patch 后的 lan-server.mjs 会优先用它),
+          // 否则回退容器内部 IP (Docker 桥接网下手机访问不到, 需 host 网络或显式传入)。
+          import { spawn } from "node:child_process";
+
+          const WEB_PORT = String(process.env.WEB_PORT || 13000);
+          const LAN_PORT = String(process.env.LAN_PORT || 13001);
+
+          console.log(`[start] web  -> :${WEB_PORT}   relay -> :${LAN_PORT}`);
+          console.log(`[start] LAN_PUBLIC_HOST=${process.env.LAN_PUBLIC_HOST || "(unset -> 容器内部IP)"}`);
+
+          const web = spawn("npx", ["next", "start", "-p", WEB_PORT], { stdio: "inherit", shell: true });
+          const relay = spawn("node", ["script/lan-server.mjs"], { stdio: "inherit", shell: true });
+
+          let stopping = false;
+          function shutdown(code) {
+            if (stopping) return;
+            stopping = true;
+            try { web.kill("SIGTERM"); } catch {}
+            try { relay.kill("SIGTERM"); } catch {}
+            setTimeout(() => process.exit(typeof code === "number" ? code : 0), 2000);
+          }
+          process.on("SIGTERM", () => shutdown(0));
+          process.on("SIGINT", () => shutdown(0));
+          web.on("exit", (c) => shutdown(c ?? 0));
+          relay.on("exit", (c) => shutdown(c ?? 0));
+          STARTEOF
+
+          echo "=== 已生成构建文件 ==="
+          ls -la Dockerfile .dockerignore docker/start.mjs
+
+      # 3. 设置 QEMU (跨架构构建)
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # 4. 设置 Docker Buildx
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 5. 登录 GitHub Container Registry (内置令牌, 无需额外配置)
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 6. (可选) 登录 Docker Hub
+      - name: 登录 Docker Hub
+        if: ${{ github.event.inputs.push_dockerhub == 'true' && secrets.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 7. 提取元数据 / 标签
+      - name: 提取镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+            ${{ (github.event.inputs.push_dockerhub == 'true' && secrets.DOCKERHUB_USERNAME != '') && format('{0}/{1}', secrets.DOCKERHUB_USERNAME, env.IMAGE_NAME) || '' }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}},enable=${{ github.event.inputs.tag_version != 'false' }},value=${{ steps.version.outputs.version }}
+          flavor: |
+            latest=false
+
+      # 8. 读取 package.json version (供 version 标签使用)
+      - name: 读取版本号
+        id: version
+        if: ${{ github.event.inputs.tag_version != 'false' }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "package.json version = $VERSION"
+
+      # 9. 构建并推送 (使用上一步生成的 Dockerfile 与 .dockerignore)
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            SKIP_SW_STAMP=false
+
+      # 10. 汇总
+      - name: 构建摘要
+        run: |
+          echo "### 构建完成 🎉" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "镜像: \`${{ env.IMAGE_NAME }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "平台: \`${{ env.PLATFORMS }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "标签:" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
