@@ -291,8 +291,8 @@ jobs:
           echo "gh_owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
           echo "dh_owner=$(echo '${{ secrets.DOCKERHUB_USERNAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
-      # 10. 构建并推送 (使用 src/ 下生成的 Dockerfile 与 .dockerignore)
-      - name: 构建并推送镜像
+      # 10a. 构建并推送 Docker Hub (主推送, 必须成功)
+      - name: 构建并推送 Docker Hub
         uses: docker/build-push-action@v6
         with:
           context: build-context
@@ -302,17 +302,45 @@ jobs:
           # 关闭 build provenance/attestation: 多平台镜像会额外推送 attestation
           # manifest, 短时间内大量请求易触发注册表二级速率限制
           provenance: false
-          # 固定推送 Docker Hub + GHCR, 标签: latest / <package.json version>
+          # 固定推送 Docker Hub, 标签: latest / <package.json version>
           # 注意: 命名空间必须全小写 (OCI 规范), 故用 steps.names.outputs 的小写值
           tags: |
             ${{ steps.names.outputs.dh_owner }}/${{ env.IMAGE_NAME }}:latest
             ${{ steps.names.outputs.dh_owner }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ steps.names.outputs.gh_owner }}/${{ env.IMAGE_NAME }}:latest
-            ghcr.io/${{ steps.names.outputs.gh_owner }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
             SKIP_SW_STAMP=false
+
+      # 10b. 推送 GHCR (与 Docker Hub 分两次调用, 降低单 registry 瞬时请求量;
+      #   限流时不影响 Docker Hub 已成功的镜像。失败不阻断 job, 限流窗口过后再重跑即可)
+      - name: 推送 GHCR (带重试, 失败不报错)
+        continue-on-error: true
+        run: |
+          set +e
+          ok=0
+          for i in 1 2 3 4 5; do
+            echo "=== GHCR 推送尝试 $i/5 ==="
+            if docker buildx build \
+              --platform "${{ env.PLATFORMS }}" \
+              --tag ghcr.io/${{ steps.names.outputs.gh_owner }}/${{ env.IMAGE_NAME }}:latest \
+              --tag ghcr.io/${{ steps.names.outputs.gh_owner }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }} \
+              --push \
+              build-context; then
+              echo "✔ GHCR 推送成功"
+              ok=1
+              break
+            fi
+            if [ "$i" -lt 5 ]; then
+              WAIT=$((i * 60))
+              echo "⚠ GHCR 推送受限, 等待 ${WAIT}s 后重试..."
+              sleep "$WAIT"
+            else
+              echo "✖ GHCR 推送失败 (已重试 5 次), 不阻断 Docker Hub 镜像"
+            fi
+          done
+          # 无论成功失败均以 0 退出, 确保该步骤绝不报错
+          exit 0
 
       # 11. 汇总
       - name: 构建摘要
