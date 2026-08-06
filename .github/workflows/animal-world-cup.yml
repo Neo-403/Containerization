@@ -120,9 +120,16 @@ jobs:
           FROM node:20-alpine AS deps
           ENV PNPM_HOME=/usr/local/pnpm
           ENV PATH=$PNPM_HOME:$PATH
+          # 用 npm 装确定版本 pnpm（避免 corepack prepare 联网下载 shim 失败）
+          # 项目 lockfileVersion=9.0，pnpm@9 兼容。
           RUN npm install -g pnpm@9
           WORKDIR /app
 
+          # 仅拷贝依赖清单，利用层缓存。
+          # 注意：不拷贝 pnpm-workspace.yaml —— 它只有 allowBuilds/onlyBuiltDependencies、
+          # 没有 packages 字段，会被 pnpm 当成 workspace 配置并报
+          # "packages field missing or empty"。allow 已写在 package.json 的
+          # pnpm.onlyBuiltDependencies 中，无需该文件
           COPY package.json pnpm-lock.yaml ./
           COPY next.config.mjs open-next.config.ts jsconfig.json ./
           RUN --mount=type=cache,target=/usr/local/pnpm/store \
@@ -136,6 +143,9 @@ jobs:
           ENV NEXT_TELEMETRY_DISABLED=1
           ENV NODE_ENV=production
 
+          # 整合构建逻辑：等价于 package.json 的 "build"
+          #   node script/stamp-sw-version.mjs && node script/safe-build.mjs
+          # stamp-sw-version 会改写 public/sw.js —— 只在镜像副本内完成，不污染源码仓库。
           ARG SKIP_SW_STAMP=false
           RUN if [ "$SKIP_SW_STAMP" = "true" ]; then \
                 echo "[build] SKIP_SW_STAMP=true, 跳过 sw.js 版本戳"; \
@@ -144,35 +154,35 @@ jobs:
               fi
           RUN node script/safe-build.mjs
 
-          # patch: 让 relay 优先使用 LAN_PUBLIC_HOST 作为对外可达 IP
-          RUN node -e 'const fs=require("fs");const f="script/lan-server.mjs";let s=fs.readFileSync(f,"utf8");s=s.replace("ip: lanIP()","ip: process.env.LAN_PUBLIC_HOST||lanIP()");s=s.replace("const ip = lanIP();","const ip = process.env.LAN_PUBLIC_HOST||lanIP()");fs.writeFileSync(f,s);console.log("[patch] lan-server 现已支持 LAN_PUBLIC_HOST");'
-
-          # patch: 前端 WebSocket 地址支持运行时变量 __LAN_WS_URL (反代/子路径/wss 场景)
-          RUN node -e 'const fs=require("fs");const f="app/lan/lanClient.js";let s=fs.readFileSync(f,"utf8");s=s.replace("return `ws://${host}:${LAN_PORT}`;","if(window.__LAN_WS_URL)return window.__LAN_WS_URL;\n  return `ws://${host}:${LAN_PORT}`;");fs.writeFileSync(f,s);console.log("[patch] lanClient 现已支持 __LAN_WS_URL");'
-
-          # patch: 大屏二维码/pad 链接支持运行时变量 __WEB_PUBLIC_URL (https/子路径场景)
-          RUN node -e 'const fs=require("fs");const f="app/lobby/LobbyClient.jsx";let s=fs.readFileSync(f,"utf8");s=s.replace("const url = `http://${msg.ip}:${msg.port}/pad?room=${msg.room}`;","const base=(typeof window!==\"undefined\"&&window.__WEB_PUBLIC_URL)?window.__WEB_PUBLIC_URL.replace(/\\/+$/,\"\"):`http://${msg.ip}:${msg.port}`;\n          const url = `${base}/pad?room=${msg.room}`;");fs.writeFileSync(f,s);console.log("[patch] LobbyClient 现已支持 __WEB_PUBLIC_URL");'
-
-          # patch: layout 引入运行时配置脚本 /lan-runtime.js (由 docker/start.mjs 在运行时生成)
-          RUN node -e 'const fs=require("fs");const f="app/layout.jsx";let s=fs.readFileSync(f,"utf8");s=s.replace("</head>","    <script src=\"/lan-runtime.js\" defer></script>\n      </head>");fs.writeFileSync(f,s);console.log("[patch] layout 已引入 lan-runtime.js");'
+          # 注：不在构建期 patch 源码。WebSocket 改写、二维码对外地址、relay 对外 IP
+          # 全部由运行时的 docker/start.mjs 处理（见下方 start.mjs 说明）。
 
           # ---- Stage 3: 运行时 -------------------------------------------------------
           FROM node:20-alpine AS runner
           WORKDIR /app
+          # 生产
           ENV NODE_ENV=production
+          # 禁用遥测
           ENV NEXT_TELEMETRY_DISABLED=1
+          # Web服务端口
           ENV WEB_PORT=13000
+          # 联机服务端口
           ENV LAN_PORT=13001
+          # 启用 LAN 中继
           ENV ENABLE_LAN_RELAY=true
 
+          # 非 root 运行(nodejs)
           RUN addgroup --system --gid 1001 nodejs \
            && adduser  --system --uid 1001 nextjs
 
+          # 从 deps 阶段拷贝完整依赖（含运行时所需的 sharp 等）
           COPY --from=deps --chown=nextjs:nodejs /app/node_modules ./node_modules
+          # 构建产物与公共资源
           COPY --from=builder --chown=nextjs:nodejs /app/.next ./.next
           COPY --from=builder --chown=nextjs:nodejs /app/public ./public
           COPY --from=builder --chown=nextjs:nodejs /app/next.config.mjs ./next.config.mjs
           COPY --from=builder --chown=nextjs:nodejs /app/package.json ./package.json
+          # 局域网 relay 与容器启动脚本
           COPY --from=builder --chown=nextjs:nodejs /app/script/lan-server.mjs ./script/lan-server.mjs
           COPY --from=builder --chown=nextjs:nodejs /app/docker/start.mjs ./docker/start.mjs
 
@@ -180,9 +190,7 @@ jobs:
 
           EXPOSE 13000 13001
 
-          HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-            CMD wget -qO- http://127.0.0.1:13000/ >/dev/null 2>&1 || exit 1
-
+          # 启动命令：由 start.mjs 同时拉起 Web 与 relay，并完成运行时 patch
           CMD ["node", "docker/start.mjs"]
           DOCKEREOF
 
@@ -201,53 +209,254 @@ jobs:
           IGNOREEOF
 
           # 2.3 docker/start.mjs (容器启动器, 同时拉起 Web 与 LAN relay)
+          #     与仓库 docker/start.mjs 保持一致 (运行时方案，不修改镜像内源码)：
+          #       - 生成 public/lan-runtime.js (浏览器 Shim: WebSocket 改写 + 发布
+          #         window.__WEB_PUBLIC_URL)，由反向代理 nginx 注入到每个页面 </head> 前
+          #       - 正则改写 .next 编译产物 chunk，让二维码/链接优先用 WEB_PUBLIC_URL
+          #       - patch relay 副本，让其对公网回报 LAN_PUBLIC_HOST / LAN_PUBLIC_PORT
           mkdir -p build-context/docker
           cat > build-context/docker/start.mjs << 'STARTEOF'
-          // 容器入口 (由 CI 动态生成). 同时拉起:
-          //   1) Next.js Web 服务 (next start -p WEB_PORT)
-          //   2) 局域网对战 relay (script/lan-server.mjs, 监听 LAN_PORT)
-          // 局域网联机的二维码/房间号由 relay 生成; relay 对外 IP 通过
-          // LAN_PUBLIC_HOST 注入 (patch 后的 lan-server.mjs 会优先用它),
-          // 否则回退容器内部 IP (Docker 桥接网下手机访问不到, 需 host 网络或显式传入)。
+          // =============================================================================
+          // 容器入口脚本 (animal-world-cup)
           //
-          // 前端对外地址 (WebSocket / pad 链接) 通过两个运行时变量控制:
-          //   LAN_WS_URL    手机连的 WebSocket 完整地址, 如 wss://域名/ws、ws://IP:13001
-          //   WEB_PUBLIC_URL Web 对外基址(可含 https 与子路径), 如 https://域名、https://域名/项目名
-          // 未设置时前端回退到内网裸 IP+端口的默认行为。
+          // 本脚本在容器启动时运行，负责「不修改镜像内源码」地让前端支持：
+          //   1) WebSocket (Mixed Content) 修复：把前端的 ws:// 请求改写成 LAN_WS_URL
+          //      （HTTPS 反代场景下应为 wss://）。
+          //   2) 二维码 / pad 链接使用对外地址 (WEB_PUBLIC_URL)：域名 + HTTPS 场景，
+          //      而不是容器内部 IP。
+          //   3) 联机 relay 回报对外可达的 host/port (LAN_PUBLIC_HOST / LAN_PUBLIC_PORT)。
+          //
+          // 设计原则：全部运行时完成，镜像内源码保持原样。
+          //   - 浏览器 Shim 写成 public/lan-runtime.js，由「反向代理 (nginx)」注入到
+          //     每个页面的 </head> 之前（见 docker/nginx-lan.conf 的 sub_filter）。
+          //     之所以放在反代层，是因为 Next.js App Router 的 /lobby 等客户端路由是在
+          //     运行时通过 RSC 流式渲染的，.next 里没有对应的静态 .html，容器启动时
+          //     无法靠改 HTML 注入脚本；只有反代层能覆盖所有路由。
+          //   - 二维码链接的拼接字符串在编译后的 chunk 里（app/lobby/page-*.js），
+          //     通过正则改写该 chunk，使其读取 window.__WEB_PUBLIC_URL。
+          //
+          // 所有行为都由环境变量驱动，全部可选、均有安全默认值：
+          //   WEB_PORT           Web 服务端口          默认 13000
+          //   LAN_PORT           联机 relay 端口       默认 13001
+          //   ENABLE_LAN_RELAY   是否启用 relay        默认 true (设 "false" 关闭)
+          //   LAN_WS_URL         前端 WebSocket 目标   默认 ws://<同主机>:LAN_PORT
+          //                        HTTPS 反代场景设为 wss://域名:端口/ws
+          //   LAN_PUBLIC_HOST    relay 回报的对公网 host（二维码/日志用）
+          //                        为空则自动取容器内部 IP（桥接网下手机可能连不到）
+          //   LAN_PUBLIC_PORT    relay 回报的对公网 port  默认同 WEB_PORT
+          //   WEB_PUBLIC_URL     Web 对外基址（二维码/pad 链接用）
+          //                        例如 https://域名:8443；为空则用内部地址
+          //
+          // 用法：docker run ... --entrypoint node 镜像 docker/start.mjs
+          //       或在 docker-compose 里 entrypoint: ["node","docker/start.mjs"]
+          // =============================================================================
+
           import { spawn } from "node:child_process";
-          import { writeFileSync, mkdirSync } from "node:fs";
+          import { readFile, writeFile, mkdir } from "node:fs/promises";
+          import path from "node:path";
 
-          const WEB_PORT = String(process.env.WEB_PORT || 13000);
-          const LAN_PORT = String(process.env.LAN_PORT || 13001);
+          // 应用根目录。Docker 里固定为 /app 且 cwd 是 /app；本地调试可用 APP_DIR 覆盖，
+          // 否则回退到当前工作目录。
+          const APP_DIR = process.env.APP_DIR || process.cwd();
+          const PUBLIC_DIR = path.join(APP_DIR, "public");
+          const REPO_RELAY = path.join(APP_DIR, "script", "lan-server.mjs");
+          // relay 的运行时 patch 副本（不覆盖原文件，便于排查）
+          const PATCHED_RELAY = path.join(APP_DIR, "script", ".lan-server.patched.mjs");
 
-          // 运行时生成前端运行时配置 (不修改镜像内源码, 仅写入 public/ 静态目录)
-          const wsUrl = (process.env.LAN_WS_URL || "").trim();
-          const webUrl = (process.env.WEB_PUBLIC_URL || "").trim();
-          const cfg = [];
-          if (wsUrl) cfg.push(`window.__LAN_WS_URL=${JSON.stringify(wsUrl)};`);
-          if (webUrl) cfg.push(`window.__WEB_PUBLIC_URL=${JSON.stringify(webUrl)};`);
-          mkdirSync("public", { recursive: true });
-          writeFileSync("public/lan-runtime.js", cfg.join("\n") + "\n");
-          console.log(`[start] lan-runtime.js -> ${cfg.length ? "已注入自定义对外地址" : "空 (使用内网 IP+端口 默认行为)"}`);
+          // ---- 环境变量 --------------------------------------------------------------
+          const WEB_PORT = Number(process.env.WEB_PORT || 13000);
+          const LAN_PORT = Number(process.env.LAN_PORT || 13001);
+          // ENABLE_LAN_RELAY 默认开启；显式设为 "false" 才关闭（web-only 模式）
+          const ENABLE_LAN_RELAY = (process.env.ENABLE_LAN_RELAY ?? "true") !== "false";
 
-          console.log(`[start] web  -> :${WEB_PORT}   relay -> :${LAN_PORT}`);
-          console.log(`[start] LAN_PUBLIC_HOST=${process.env.LAN_PUBLIC_HOST || "(unset -> 容器内部IP)"}`);
+          // 前端 WebSocket 目标。不设置时默认 ws://<当前访问主机名>:LAN_PORT，
+          // 这样「直端口部署（HTTP + IP）」零配置即可工作。
+          // HTTPS 反代场景必须设置，例如：LAN_WS_URL=wss://your.domain:8443/ws
+          const LAN_WS_URL = (process.env.LAN_WS_URL || "").trim();
 
-          const web = spawn("npx", ["next", "start", "-p", WEB_PORT], { stdio: "inherit", shell: true });
-          const relay = spawn("node", ["script/lan-server.mjs"], { stdio: "inherit", shell: true });
+          // relay 回报的对公网 host/port。为空则 host 自动取容器内部 IP、port 取 WEB_PORT。
+          const LAN_PUBLIC_HOST = (process.env.LAN_PUBLIC_HOST || "").trim();
+          const LAN_PUBLIC_PORT = (process.env.LAN_PUBLIC_PORT || "").trim();
 
-          let stopping = false;
-          function shutdown(code) {
-            if (stopping) return;
-            stopping = true;
-            try { web.kill("SIGTERM"); } catch {}
-            try { relay.kill("SIGTERM"); } catch {}
-            setTimeout(() => process.exit(typeof code === "number" ? code : 0), 2000);
+          // Web 对外基址（二维码/pad 链接）。为空 => 不设置 window.__WEB_PUBLIC_URL，
+          // 前端回退到内部 http://ip:port 默认行为。
+          const WEB_PUBLIC_URL = (process.env.WEB_PUBLIC_URL || "").trim();
+
+          // 注：<script src="/lan-runtime.js"> 的注入由反代层 (docker/nginx-lan.conf)
+          // 完成，以覆盖运行时渲染的 /lobby 等路由。本脚本只负责「生成」该文件。
+
+          // ---- 1. 生成 public/lan-runtime.js（浏览器运行时 Shim） -------------------
+          async function generateRuntime() {
+            const wss = LAN_WS_URL || ""; // 空 => 运行时自动用 同主机:LAN_PORT
+            const port = LAN_PORT;
+            const webPublic = WEB_PUBLIC_URL;
+            // Shim 是纯浏览器 IIFE。只内嵌公开的连接提示（JSON 字面量），不含任何密钥。
+            const shim = `(function () {
+            // ---- WebSocket 改写（修复 Mixed Content）----
+            // LAN_WS_URL 未设置时的默认目标：ws://<当前主机>:port
+            var WSS = ${JSON.stringify(wss)};
+            var PORT = ${JSON.stringify(port)};
+            if (!WSS) {
+              try { WSS = "ws://" + window.location.hostname + ":" + PORT; } catch (e) { WSS = ""; }
+            }
+            // 保存原始构造函数，替换全局 WebSocket：遇到非 wss:// 的地址（即明文 ws://
+            // 或包含 :port 的地址）都改写为我们的 relay 目标（WSS）。
+            var O = window.WebSocket;
+            function Patched(u, p) {
+              if (typeof u === "string" && u.indexOf("wss://") !== 0) {
+                if (u.indexOf("ws://") === 0 || u.indexOf(":" + PORT) !== -1) {
+                  u = WSS;
+                }
+              }
+              return new O(u, p);
+            }
+            Patched.prototype = O.prototype;
+            window.WebSocket = Patched;
+
+            // ---- 对外地址（二维码 + pad 链接）----
+            // 编译后的 LobbyClient (app/lobby/page-*.js) 已被本脚本的 patchLobbyChunks()
+            // 改写为：当 window.__WEB_PUBLIC_URL 存在时优先使用它。这里只需「发布」该值；
+            // 为空则保持不设置，前端回退到内部默认地址。
+            // 设 WEB_PUBLIC_URL 为例如 https://your.domain:8443 即可让二维码/链接走公网。
+            var WEB_PUBLIC = ${JSON.stringify(webPublic)};
+            if (WEB_PUBLIC) {
+              try { window.__WEB_PUBLIC_URL = WEB_PUBLIC; } catch (e) {}
+            }
+
+            console.log("[lan-runtime] WebSocket ->", WSS || ("ws://<host>:" + PORT), "| WEB_PUBLIC_URL =", WEB_PUBLIC || "(internal default)");
+          })();
+          `;
+            await mkdir(PUBLIC_DIR, { recursive: true });
+            await writeFile(path.join(PUBLIC_DIR, "lan-runtime.js"), shim, "utf8");
+            console.log("[start] wrote public/lan-runtime.js");
+            return shim;
           }
-          process.on("SIGTERM", () => shutdown(0));
-          process.on("SIGINT", () => shutdown(0));
-          web.on("exit", (c) => shutdown(c ?? 0));
-          relay.on("exit", (c) => shutdown(c ?? 0));
+
+          // ---- 2. patch relay 副本（让 relay 回报可配置的公网 host/port） ------------
+          async function prepareRelay() {
+            if (!ENABLE_LAN_RELAY) return null;
+            let src;
+            try {
+              src = await readFile(REPO_RELAY, "utf8");
+            } catch {
+              console.log("[start] relay source not found at", REPO_RELAY, "- skipping relay start (web-only mode).");
+              return null;
+            }
+
+            // 把 `hosted` 消息里的回报地址改成可配置：
+            //   ip:   LAN_PUBLIC_HOST 有值 -> 字面量；否则保留 lanIP() 自动获取
+            //   port: LAN_PUBLIC_PORT 有值 -> 字面量；否则用 WEB_PORT
+            const newIp = LAN_PUBLIC_HOST
+              ? JSON.stringify(LAN_PUBLIC_HOST)
+              : "lanIP()";
+            const newPort = LAN_PUBLIC_PORT ? JSON.stringify(LAN_PUBLIC_PORT) : String(WEB_PORT);
+
+            src = src.replace(
+              /send\(ws, \{ t: "hosted", room: code, ip: lanIP\(\), port: 13000, slots: SLOTS \}\);/,
+              `send(ws, { t: "hosted", room: code, ip: ${newIp}, port: ${newPort}, slots: SLOTS });`
+            );
+
+            await writeFile(PATCHED_RELAY, src, "utf8");
+            console.log("[start] relay public host =", LAN_PUBLIC_HOST || "(auto)", "| port =", newPort);
+            return PATCHED_RELAY;
+          }
+
+          // ---- 2b. patch 编译后的 chunk，让二维码链接优先用 WEB_PUBLIC_URL ----------
+          // 预编译的 LobbyClient 把链接写死成 "http://"+msg.ip+":"+msg.port+"/pad?room="+msg.room。
+          // 无法改源码，只能运行时改写编译产物。Next 构建产物里实际是 .concat() 形式：
+          //   "http://".concat(e.ip,":").concat(e.port,"/pad?room=").concat(e.room)
+          // 改写为：window.__WEB_PUBLIC_URL 存在时用它，否则回退原表达式。
+          // 属性名 (.ip/.port/.room) 在压缩后保留，故该模式跨构建稳定。
+          async function walkJs(dir, out = []) {
+            let ents;
+            try { ents = await import("node:fs/promises").then((m) => m.readdir(dir, { withFileTypes: true })); }
+            catch { return out; }
+            for (const e of ents) {
+              const p = path.join(dir, e.name);
+              if (e.isDirectory()) await walkJs(p, out);
+              else if (e.name.endsWith(".js")) out.push(p);
+            }
+            return out;
+          }
+
+          async function patchLobbyChunks() {
+            const base = path.join(APP_DIR, ".next", "static", "chunks");
+            let files = [];
+            try { files = await walkJs(base); } catch { return; }
+            // 匹配编译产物实际发出的 .concat() 形式（容忍空白）
+            const re = /"http:\/\/"\s*\.concat\(\s*([A-Za-z0-9_$]+\.ip)\s*,\s*":"\s*\)\s*\.concat\(\s*([A-Za-z0-9_$]+\.port)\s*,\s*"\/pad\?room="\s*\)\s*\.concat\(\s*([A-Za-z0-9_$]+\.room)\s*\)/g;
+            let patched = 0;
+            for (const f of files) {
+              try {
+                const code = await readFile(f, "utf8");
+                if (!code.includes("/pad?room=")) continue;
+                // 已 patch 过（含 __WEB_PUBLIC_URL 且正则不再匹配）则跳过，避免重复处理
+                if (code.includes("__WEB_PUBLIC_URL") && !re.test(code)) continue;
+                re.lastIndex = 0;
+                if (!re.test(code)) continue;
+                re.lastIndex = 0;
+                const out = code.replace(re, (m, ip, port, room) =>
+                  `(window.__WEB_PUBLIC_URL?window.__WEB_PUBLIC_URL.replace(/\/$/,""):("http://"+((${ip}))+":"+((${port}))))+"/pad?room="+((${room}))`);
+                if (out === code) continue;
+                await writeFile(f, out, "utf8");
+                patched++;
+              } catch {}
+            }
+            if (patched) console.log(`[start] patched ${patched} chunk(s) to honor WEB_PUBLIC_URL`);
+            else console.log("[start] NOTE: lobby join-URL chunk not found/patched (WEB_PUBLIC_URL will be ignored by client)");
+          }
+
+          // ---- 3. 拉起子进程（Web + relay）-----------------------------------------
+          const children = [];
+          function run(cmd, args, opts = {}) {
+            const c = spawn(cmd, args, { stdio: "inherit", env: process.env, ...opts });
+            c.on("exit", (code, sig) => {
+              console.log(`[start] ${cmd} ${args.join(" ")} exited (${code ?? sig})`);
+              shutdown();
+            });
+            children.push(c);
+            return c;
+          }
+
+          let shutting = false;
+          function shutdown() {
+            if (shutting) return;
+            shutting = true;
+            for (const c of children) {
+              try { c.kill("SIGTERM"); } catch {}
+            }
+            // 给子进程一点优雅退出时间，超时则强杀
+            setTimeout(() => {
+              for (const c of children) { try { c.kill("SIGKILL"); } catch {} }
+              process.exit(0);
+            }, 3000).unref();
+          }
+          process.on("SIGINT", shutdown);
+          process.on("SIGTERM", shutdown);
+          process.on("SIGQUIT", shutdown);
+
+          async function main() {
+            await generateRuntime();       // 1. 生成浏览器 Shim
+            await patchLobbyChunks();      // 2. 改写编译产物 chunk（二维码链接优先用 WEB_PUBLIC_URL）
+            const relay = await prepareRelay(); // 3. 生成 patch 后的 relay 副本
+
+            // Web 服务
+            run("node", [path.join(APP_DIR, "node_modules", "next", "dist", "bin", "next"), "start", "-p", String(WEB_PORT)], {
+              cwd: APP_DIR,
+            });
+
+            // 联机 relay
+            if (relay) {
+              run("node", [relay], { cwd: APP_DIR, env: { ...process.env, LAN_PORT: String(LAN_PORT) } });
+            }
+
+            console.log(`[start] web on :${WEB_PORT}, relay on :${LAN_PORT}, LAN relay ${ENABLE_LAN_RELAY ? "on" : "off"}`);
+          }
+
+          main().catch((e) => {
+            console.error("[start] fatal:", e);
+            process.exit(1);
+          });
           STARTEOF
 
           echo "=== 已生成构建文件 ==="
