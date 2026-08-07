@@ -1107,8 +1107,8 @@ jobs:
           tags: |
             ${{ steps.names.outputs.dh_owner }}/${{ env.IMAGE_NAME }}:latest
             ${{ steps.names.outputs.dh_owner }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # cache-from: type=gha
+          # cache-to: type=gha,mode=max
           build-args: |
             SKIP_SW_STAMP=false
 
