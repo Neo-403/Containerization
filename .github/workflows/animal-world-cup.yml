@@ -185,10 +185,13 @@ jobs:
           # 局域网 relay 与容器启动脚本
           COPY --from=builder --chown=nextjs:nodejs /app/script/lan-server.mjs ./script/lan-server.mjs
           COPY --from=builder --chown=nextjs:nodejs /app/docker/start.mjs ./docker/start.mjs
+          # 公网对战房间服务 (零依赖 Node 实现)
+          COPY --from=builder --chown=nextjs:nodejs /app/online/server.mjs ./online/server.mjs
+          COPY --from=builder --chown=nextjs:nodejs /app/online/shared.js ./online/shared.js
 
           USER nextjs
 
-          EXPOSE 13000 13001
+          EXPOSE 13000 13001 13002
 
           # 启动命令：由 start.mjs 同时拉起 Web 与 relay，并完成运行时 patch
           CMD ["node", "docker/start.mjs"]
@@ -225,6 +228,11 @@ jobs:
           //   2) 二维码 / pad 链接使用对外地址 (WEB_PUBLIC_URL)：域名 + HTTPS 场景，
           //      而不是容器内部 IP。
           //   3) 联机 relay 回报对外可达的 host/port (LAN_PUBLIC_HOST / LAN_PUBLIC_PORT)。
+          //   4) 公网对战房间服务 (online service)：监听 ONLINE_PORT(默认 13002)，提供
+          //      /create (建房 REST) 与 /connect (房间 WebSocket)。原项目公网对战依赖
+          //      Cloudflare Worker，这里用 online/server.mjs (零依赖 Node 实现) 自托管。
+          //      前端 onlineClient.js 在公网访问时把请求发往 window.location.origin，
+          //      所以反代 (nginx) 需把 /create 与 /connect 转发到本服务的 ONLINE_PORT。
           //
           // 设计原则：全部运行时完成，镜像内源码保持原样。
           //   - 浏览器 Shim 写成 public/lan-runtime.js，由「反向代理 (nginx)」注入到
@@ -246,6 +254,9 @@ jobs:
           //   LAN_PUBLIC_PORT    relay 回报的对公网 port  默认同 WEB_PORT
           //   WEB_PUBLIC_URL     Web 对外基址（二维码/pad 链接用）
           //                        例如 https://域名:8443；为空则用内部地址
+          //   ONLINE_PORT        公网房间服务端口          默认 13002
+          //   ENABLE_ONLINE      是否启用公网房间服务       默认 true (设 "false" 关闭)
+          //   ALLOWED_ORIGINS    允许跨域的 Origin(逗号分隔) 默认不限制(*)
           //
           // 用法：docker run ... --entrypoint node 镜像 docker/start.mjs
           //       或在 docker-compose 里 entrypoint: ["node","docker/start.mjs"]
@@ -281,6 +292,12 @@ jobs:
           // Web 对外基址（二维码/pad 链接）。为空 => 不设置 window.__WEB_PUBLIC_URL，
           // 前端回退到内部 http://ip:port 默认行为。
           const WEB_PUBLIC_URL = (process.env.WEB_PUBLIC_URL || "").trim();
+
+          // 公网房间服务 (online service)
+          const ONLINE_PORT = Number(process.env.ONLINE_PORT || 13002);
+          // ENABLE_ONLINE 默认开启；显式设为 "false" 才关闭
+          const ENABLE_ONLINE = (process.env.ENABLE_ONLINE ?? "true") !== "false";
+          const ONLINE_SERVER = path.join(APP_DIR, "online", "server.mjs");
 
           // 注：<script src="/lan-runtime.js"> 的注入由反代层 (docker/nginx-lan.conf)
           // 完成，以覆盖运行时渲染的 /lobby 等路由。本脚本只负责「生成」该文件。
@@ -445,12 +462,20 @@ jobs:
               cwd: APP_DIR,
             });
 
-            // 联机 relay
-            if (relay) {
-              run("node", [relay], { cwd: APP_DIR, env: { ...process.env, LAN_PORT: String(LAN_PORT) } });
-            }
+          // 联机 relay
+          if (relay) {
+            run("node", [relay], { cwd: APP_DIR, env: { ...process.env, LAN_PORT: String(LAN_PORT) } });
+          }
 
-            console.log(`[start] web on :${WEB_PORT}, relay on :${LAN_PORT}, LAN relay ${ENABLE_LAN_RELAY ? "on" : "off"}`);
+          // 公网对战房间服务 (online service, 零依赖 Node 实现)
+          if (ENABLE_ONLINE) {
+            run("node", [ONLINE_SERVER], {
+              cwd: APP_DIR,
+              env: { ...process.env, ONLINE_PORT: String(ONLINE_PORT) },
+            });
+          }
+
+          console.log(`[start] web on :${WEB_PORT}, relay on :${LAN_PORT}, online on :${ENABLE_ONLINE ? ONLINE_PORT : "off"}, LAN relay ${ENABLE_LAN_RELAY ? "on" : "off"}`);
           }
 
           main().catch((e) => {
@@ -459,8 +484,574 @@ jobs:
           });
           STARTEOF
 
+          # 2.4 公网对战房间服务 (online service, 零依赖 Node 实现)
+          #     原项目公网对战依赖 Cloudflare Worker (Durable Objects)，自托管环境缺失。
+          #     这里把 online/server.mjs 与 online/shared.js 写入构建上下文 (上游仓库不含
+          #     这两个文件)，由上方 Dockerfile 的 COPY 阶段一并打进镜像。
+          #     前端 onlineClient.js 在公网访问时把请求发往 window.location.origin，
+          #     在局域网直访问时直连 ws://<host>:13002 (需把 13002 映射到宿主机)。
+          mkdir -p build-context/online
+          cat > build-context/online/shared.js << 'SHAREDEOF'
+          export const ONLINE_MODES = ["direct", "controllers"];
+
+          export const ONLINE_TEAMS = [
+            "england",
+            "france",
+            "germany",
+            "spain",
+            "portugal",
+            "brazil",
+            "argentina",
+            "usa",
+          ];
+
+          export const ONLINE_FORMATIONS = ["2-3-1", "3-2-1", "2-2-2", "3-1-2", "1-3-2", "2-1-3"];
+          export const ONLINE_TIMES = [4, 6, 10];
+          export const ONLINE_AI_LEVELS = [0, 1, 2];
+          export const ONLINE_ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+          export const ONLINE_ROOM_CODE_LENGTH = 6;
+          export const ONLINE_ROOM_TTL_MS = 30 * 60 * 1000;
+          export const ONLINE_RECONNECT_GRACE_MS = 30 * 1000;
+
+          function oneOf(value, values, fallback) {
+            return values.includes(value) ? value : fallback;
+          }
+
+          export function normalizeRoomCode(value) {
+            return String(value || "")
+              .toUpperCase()
+              .replace(/[^A-Z0-9]/g, "")
+              .slice(0, ONLINE_ROOM_CODE_LENGTH);
+          }
+
+          export function normalizeOnlineConfig(input = {}) {
+            const mode = oneOf(input.mode, ONLINE_MODES, "direct");
+            const red = oneOf(input.red, ONLINE_TEAMS, "argentina");
+            let blue = oneOf(input.blue, ONLINE_TEAMS, "portugal");
+            if (blue === red) blue = ONLINE_TEAMS.find((team) => team !== red) || "portugal";
+
+            const formations = input.formations || {};
+            return {
+              mode,
+              red,
+              blue,
+              side: input.side === "away" ? "away" : "home",
+              ai: oneOf(Number(input.ai), ONLINE_AI_LEVELS, 1),
+              time: oneOf(Number(input.time), ONLINE_TIMES, 6),
+              formations: {
+                red: oneOf(formations.red, ONLINE_FORMATIONS, "2-3-1"),
+                blue: oneOf(formations.blue, ONLINE_FORMATIONS, "3-2-1"),
+              },
+            };
+          }
+
+          function clampAxis(value) {
+            const number = Number(value) || 0;
+            return Math.max(-1, Math.min(1, number));
+          }
+
+          export function sanitizeOnlineInput(value = {}) {
+            return {
+              vx: clampAxis(value.vx),
+              vy: clampAxis(value.vy),
+              shoot: !!value.shoot,
+              sprint: !!value.sprint,
+              pass: !!value.pass,
+              lob: !!value.lob,
+              switchPlayer: !!value.switchPlayer,
+              tackle: !!value.tackle,
+            };
+          }
+
+          export function canStartOnlineRoom(config, roster) {
+            if (!config || !roster || !roster.screen) return false;
+            if (config.mode === "direct") return true;
+            return roster.pads.some((pad) => pad.slot === 0) && roster.pads.some((pad) => pad.slot === 1);
+          }
+          SHAREDEOF
+
+          cat > build-context/online/server.mjs << 'SERVEREOS'
+          // =============================================================================
+          // 公网对战房间服务 (自托管版, 零外部依赖)
+          //
+          // 原项目的公网对战后端是一个 Cloudflare Worker (cloudflare/online-worker.js,
+          // 基于 Durable Objects)。本文件用纯 Node 标准库等价实现，让自托管 Docker 部署
+          // 也能提供 /create (建房 REST) 与 /connect (房间 WebSocket) 两个端点。
+          //
+          // 协议、房间状态机、角色握手、消息路由均按 online-worker.js 移植；状态用内存
+          // Map 存储 (重启即丢, 对休闲对战足够)。
+          //
+          // 依赖: 仅 node: 内置 (http / crypto)。无需 npm 安装 ws。
+          // 启动: node online/server.mjs   端口默认 13002 (ONLINE_PORT 可改)
+          //
+          // 前端 onlineClient.js 在「公网访问」时 onlineServiceUrl() 返回 window.location
+          // .origin，所以请把反代 (nginx) 的 /create 与 /connect 转发到本服务端口。
+          // 局域网直访问时 onlineClient.js 直连 ws://<host>:13002 (需映射端口到宿主机)。
+          // =============================================================================
+
+          import http from "node:http";
+          import crypto from "node:crypto";
+          import {
+            ONLINE_ROOM_ALPHABET,
+            ONLINE_ROOM_CODE_LENGTH,
+            ONLINE_ROOM_TTL_MS,
+            ONLINE_RECONNECT_GRACE_MS,
+            canStartOnlineRoom,
+            normalizeOnlineConfig,
+            normalizeRoomCode,
+            sanitizeOnlineInput,
+          } from "./shared.js";
+
+          const PORT = Number(process.env.ONLINE_PORT || 13002);
+          const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || "")
+            .split(",").map((v) => v.trim()).filter(Boolean);
+          const MAX_JSON_BYTES = 8 * 1024;
+          const MAX_FRAME_BYTES = 64 * 1024;
+          const MAX_BUFFERED_BYTES = 512 * 1024;
+          const MAX_ROOM_SOCKETS = 8;
+          const MAX_MESSAGES_PER_SECOND = 90;
+
+          function randomCode() {
+            const bytes = crypto.randomBytes(ONLINE_ROOM_CODE_LENGTH);
+            return Array.from(bytes, (v) => ONLINE_ROOM_ALPHABET[v % ONLINE_ROOM_ALPHABET.length]).join("");
+          }
+          function randomToken() {
+            return crypto.randomBytes(18).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+          }
+          function cors(origin) {
+            return {
+              "Access-Control-Allow-Origin": origin || "*",
+              "Access-Control-Allow-Headers": "content-type",
+              "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+              Vary: "Origin",
+            };
+          }
+          function json(body, status = 200, origin = "*") {
+            return { status, headers: { "content-type": "application/json; charset=utf-8", ...cors(origin) }, body: JSON.stringify(body) };
+          }
+          function originAllowed(reqOrigin) {
+            return ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(reqOrigin || "");
+          }
+
+          const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+          function acceptWebSocket(req, socket, head, onConnection, onClose) {
+            const key = req.headers["sec-websocket-key"];
+            if (!key) { socket.destroy(); return; }
+            const accept = crypto.createHash("sha1").update(key + GUID).digest("base64");
+            socket.write(
+              "HTTP/1.1 101 Switching Protocols\r\n" +
+              "Upgrade: websocket\r\n" +
+              "Connection: Upgrade\r\n" +
+              `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+            );
+            const ws = new WsConn(socket, onClose);
+            onConnection(ws);
+          }
+
+          class WsConn {
+            constructor(socket, onClose) {
+              this.socket = socket;
+              this.readyState = 0;
+              this.bufferedAmount = 0;
+              this._frags = [];
+              this._fragOp = 0;
+              this._closed = false;
+              socket.on("data", (buf) => this._onData(buf));
+              socket.on("close", () => { this.readyState = 3; this._closed = true; onClose && onClose(this); });
+              socket.on("error", () => { if (!this._closed) { this.readyState = 3; this._closed = true; onClose && onClose(this); } });
+              this.readyState = 1;
+              this.onmessage = null;
+              this.onclose = null;
+            }
+            _onData(buf) {
+              let offset = 0;
+              while (offset < buf.length) {
+                if (buf.length - offset < 2) { this._buffer = buf.slice(offset); return; }
+                const b0 = buf[offset];
+                const b1 = buf[offset + 1];
+                const fin = (b0 & 0x80) !== 0;
+                const opcode = b0 & 0x0f;
+                const masked = (b1 & 0x80) !== 0;
+                let len = b1 & 0x7f;
+                let p = offset + 2;
+                if (len === 126) { if (buf.length - p < 2) return; len = buf.readUInt16BE(p); p += 2; }
+                else if (len === 127) { if (buf.length - p < 8) return; len = Number(buf.readBigUInt64BE(p)); p += 8; }
+                let maskKey;
+                if (masked) { if (buf.length - p < 4) return; maskKey = buf.slice(p, p + 4); p += 4; }
+                if (buf.length - p < len) return;
+                let payload = buf.slice(p, p + len);
+                if (masked) {
+                  const out = Buffer.allocUnsafe(len);
+                  for (let i = 0; i < len; i++) out[i] = payload[i] ^ maskKey[i & 3];
+                  payload = out;
+                }
+                offset = p + len;
+
+                if (opcode === 0x8) { this.close(); return; }
+                if (opcode === 0x9) { this._send(0xA, payload); continue; }
+                if (opcode === 0xA) continue;
+                if (opcode === 0x1 || opcode === 0x2) {
+                  if (!fin) { this._frags.push(payload); this._fragOp = opcode; continue; }
+                  const data = opcode === 0x1 ? payload.toString("utf8") : payload;
+                  this.onmessage && this.onmessage(data);
+                } else if (opcode === 0x0) {
+                  this._frags.push(payload);
+                  if (fin) {
+                    const full = Buffer.concat(this._frags);
+                    this._frags = [];
+                    const data = this._fragOp === 0x1 ? full.toString("utf8") : full;
+                    this.onmessage && this.onmessage(data);
+                  }
+                }
+              }
+            }
+            _send(opcode, data) {
+              if (this.readyState !== 1) return;
+              const buf = Buffer.isBuffer(data) ? data : Buffer.from(data, "utf8");
+              const len = buf.length;
+              let header;
+              if (len < 126) { header = Buffer.from([0x80 | opcode, len]); }
+              else if (len < 65536) { header = Buffer.allocUnsafe(4); header[0] = 0x80 | opcode; header[1] = 126; header.writeUInt16BE(len, 2); }
+              else { header = Buffer.allocUnsafe(10); header[0] = 0x80 | opcode; header[1] = 127; header.writeBigUInt64BE(BigInt(len), 2); }
+              try { this.socket.write(Buffer.concat([header, buf])); } catch {}
+            }
+            send(value) {
+              if (typeof value === "string") this._send(0x1, value);
+              else this._send(0x2, value);
+            }
+            close(code = 1000, reason = "") {
+              if (this.readyState === 3) return;
+              this.readyState = 3;
+              try {
+                const body = Buffer.allocUnsafe(2);
+                body.writeUInt16BE(code & 0xffff, 0);
+                this._send(0x8, Buffer.concat([body, Buffer.from(reason, "utf8")]));
+                this.socket.end();
+              } catch {}
+            }
+          }
+
+          class Room {
+            constructor(code, service) {
+              this.code = code;
+              this.service = service;
+              this.record = null;
+              this.sockets = new Map();
+              this._alarm = null;
+            }
+            attachment(ws) {
+              return this.sockets.get(ws) || { role: "pending", lastSeq: -1 };
+            }
+            setAttachment(ws, att) { this.sockets.set(ws, att); }
+            find(role, slot = null) {
+              for (const [ws, item] of this.sockets) {
+                if (item.role === role && (slot == null || item.slot === slot)) return ws;
+              }
+              return null;
+            }
+            send(ws, value, droppable = false) {
+              if (!ws || ws.readyState !== 1) return;
+              if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+                if (!droppable) try { ws.close(1013, "slow-client"); } catch {}
+                return;
+              }
+              try { ws.send(value); } catch {}
+            }
+            sendJson(ws, value) { this.send(ws, JSON.stringify(value)); }
+            broadcast(value, predicate = () => true) {
+              const text = JSON.stringify(value);
+              for (const [ws, item] of this.sockets) {
+                if (item.role === "pending" || item.role === "rejected") continue;
+                if (predicate(ws, item)) this.send(ws, text);
+              }
+            }
+            roster() {
+              const pads = [];
+              for (const [ws, item] of this.sockets) {
+                if (item.role === "pad") pads.push({ slot: item.slot });
+              }
+              pads.sort((a, b) => a.slot - b.slot);
+              return { host: !!this.find("host"), screen: !!this.find("screen"), pads };
+            }
+            pushRoster() { this.broadcast({ t: "roster", roster: this.roster() }); }
+            replace(role, slot, current) {
+              const old = this.find(role, slot);
+              if (old && old !== current) try { old.close(4000, "replaced"); } catch {}
+            }
+            async acceptHello(ws, room, msg) {
+              const role = msg.role;
+              const supplied = String(msg.token || "");
+              const now = Date.now();
+              if (role === "host") {
+                if (!supplied || supplied !== room.hostToken) return { error: "host-token" };
+                room.hostReservedUntil = 0;
+                room.expiresAt = Math.max(room.expiresAt || 0, now + ONLINE_ROOM_TTL_MS);
+                this.replace("host", null, ws);
+                return { attachment: { role: "host", token: supplied, lastSeq: -1 }, token: supplied };
+              }
+              if (role === "screen") {
+                const old = this.find("screen");
+                if (old && (!supplied || supplied !== room.screenToken)) return { error: "screen-full" };
+                if (!old && room.screenToken && now < room.screenReservedUntil && supplied !== room.screenToken) return { error: "screen-reserved" };
+                const nextToken = supplied && supplied === room.screenToken ? supplied : randomToken();
+                room.screenToken = nextToken;
+                room.screenReservedUntil = 0;
+                this.replace("screen", null, ws);
+                return { attachment: { role: "screen", token: nextToken, lastSeq: -1 }, token: nextToken };
+              }
+              if (role === "pad" && room.config.mode === "controllers") {
+                let slot = Number(msg.slot);
+                if (slot !== 0 && slot !== 1) slot = this.find("pad", 0) ? 1 : 0;
+                const old = this.find("pad", slot);
+                const stored = room.padTokens[slot];
+                const invited = String(msg.invite || "") === room.padInviteTokens[slot];
+                if (old && (!supplied || supplied !== stored)) return { error: "slot-full" };
+                if (!old && stored && now < room.padReservedUntil[slot] && supplied !== stored) return { error: "slot-reserved" };
+                if ((!supplied || supplied !== stored) && !invited) return { error: "slot-invite" };
+                const nextToken = supplied && supplied === stored ? supplied : randomToken();
+                room.padTokens[slot] = nextToken;
+                room.padReservedUntil[slot] = 0;
+                this.replace("pad", slot, ws);
+                return { attachment: { role: "pad", slot, token: nextToken, lastSeq: -1 }, token: nextToken, slot };
+              }
+              return { error: "role" };
+            }
+            async onMessage(ws, message) {
+              const attachment = this.attachment(ws);
+              const now = Date.now();
+              if (!attachment.rateAt || now - attachment.rateAt >= 1000) { attachment.rateAt = now; attachment.rateCount = 0; }
+              attachment.rateCount = (attachment.rateCount || 0) + 1;
+              if (attachment.rateCount > MAX_MESSAGES_PER_SECOND) { ws.close(4008, "rate-limit"); return; }
+              if (typeof message !== "string") {
+                if (attachment.role !== "host") return;
+                if (message.byteLength > MAX_FRAME_BYTES) { ws.close(1009, "frame-too-large"); return; }
+                for (const [target, item] of this.sockets) {
+                  if (item.role === "screen") this.send(target, message, true);
+                }
+                return;
+              }
+              if (message.length > MAX_JSON_BYTES) { ws.close(1009, "message-too-large"); return; }
+              let msg;
+              try { msg = JSON.parse(message); } catch { return; }
+              const room = this.record;
+              if (!room) { ws.close(4004, "room-expired"); return; }
+              if (attachment.role === "pending") {
+                if (msg.t !== "hello") { ws.close(4001, "hello-required"); return; }
+                const accepted = await this.acceptHello(ws, room, msg);
+                if (accepted.error) {
+                  this.sendJson(ws, { t: "joinErr", reason: accepted.error });
+                  ws.close(4003, accepted.error);
+                  return;
+                }
+                this.setAttachment(ws, { ...accepted.attachment, rateAt: attachment.rateAt, rateCount: attachment.rateCount });
+                this.scheduleAlarm();
+                this.sendJson(ws, {
+                  t: accepted.attachment.role === "host" ? "hosted" : "joined",
+                  room: room.code,
+                  role: accepted.attachment.role,
+                  slot: accepted.slot,
+                  token: accepted.token,
+                  padInvites: accepted.attachment.role === "host"
+                    ? room.padInviteTokens
+                    : accepted.attachment.role === "screen" && room.config.mode === "controllers"
+                      ? [null, room.padInviteTokens[1]]
+                      : undefined,
+                  config: room.config,
+                  started: room.started,
+                  roster: this.roster(),
+                });
+                this.pushRoster();
+                return;
+              }
+              if (msg.t === "input" && (attachment.role === "screen" || attachment.role === "pad")) {
+                if (attachment.role === "screen" && room.config.mode !== "direct") return;
+                const seq = Number(msg.seq) || 0;
+                if (seq <= attachment.lastSeq) return;
+                attachment.lastSeq = seq;
+                const slot = attachment.role === "screen" ? 1 : attachment.slot;
+                this.sendJson(this.find("host"), { t: "input", slot, seq, d: sanitizeOnlineInput(msg.d) });
+                return;
+              }
+              if (msg.t === "rematchRequest" && attachment.role === "screen") {
+                this.sendJson(this.find("host"), { t: "rematchRequest" });
+                return;
+              }
+              if (attachment.role !== "host") return;
+              if (msg.t === "start") {
+                if (!canStartOnlineRoom(room.config, this.roster())) { this.sendJson(ws, { t: "startErr", reason: "not-ready" }); return; }
+                room.started = true;
+                this.broadcast({ t: "start", config: room.config });
+                return;
+              }
+              if (["event", "stats", "ended", "rematch", "stream"].includes(msg.t)) {
+                if (msg.t === "ended") room.started = false;
+                if (msg.t === "rematch") room.started = true;
+                this.broadcast(msg, (target) => target !== ws);
+              }
+            }
+            onClose(ws) {
+              const item = this.attachment(ws);
+              const room = this.record;
+              if (!room) return;
+              const now = Date.now();
+              if (item.role === "host") {
+                const anotherHost = [...this.sockets.keys()].some((t) => t !== ws && this.attachment(t).role === "host");
+                if (!anotherHost) room.hostReservedUntil = now + ONLINE_RECONNECT_GRACE_MS;
+              }
+              if (item.role === "screen") room.screenReservedUntil = now + ONLINE_RECONNECT_GRACE_MS;
+              if (item.role === "pad") room.padReservedUntil[item.slot] = now + ONLINE_RECONNECT_GRACE_MS;
+              this.sockets.delete(ws);
+              this.scheduleAlarm();
+              if (this.sockets.size > 0) this.pushRoster();
+            }
+            createRoom(body) {
+              if (this.record) return 409;
+              const now = Date.now();
+              this.record = {
+                code: body.room,
+                hostToken: body.hostToken,
+                config: normalizeOnlineConfig(body.config),
+                createdAt: now,
+                expiresAt: now + ONLINE_ROOM_TTL_MS,
+                started: false,
+                hostReservedUntil: 0,
+                screenToken: null,
+                screenReservedUntil: 0,
+                padInviteTokens: body.padInvites,
+                padTokens: [null, null],
+                padReservedUntil: [0, 0],
+              };
+              this.scheduleAlarm();
+              return 201;
+            }
+            addSocket(ws) {
+              const room = this.record;
+              if (!room) {
+                ws.send(JSON.stringify({ t: "joinErr", reason: "no-room" }));
+                ws.close(4004, "no-room");
+                return;
+              }
+              if (this.sockets.size >= MAX_ROOM_SOCKETS) {
+                ws.send(JSON.stringify({ t: "joinErr", reason: "room-busy" }));
+                ws.close(4008, "room-busy");
+                return;
+              }
+              this.sockets.set(ws, { role: "pending", connectedAt: Date.now(), lastSeq: -1 });
+              ws.onmessage = (data) => this.onMessage(ws, data);
+              ws.onclose = () => this.onClose(ws);
+              setTimeout(() => {
+                if (this.attachment(ws).role === "pending") { try { ws.close(4001, "hello-timeout"); } catch {} }
+              }, 10_000);
+            }
+            scheduleAlarm() {
+              if (this._alarm) { clearTimeout(this._alarm); this._alarm = null; }
+              const room = this.record;
+              if (!room) return;
+              const expiresAt = room.expiresAt || room.createdAt + ONLINE_ROOM_TTL_MS;
+              const deadlines = [expiresAt];
+              if (room.hostReservedUntil) deadlines.push(room.hostReservedUntil);
+              if (room.screenReservedUntil) deadlines.push(room.screenReservedUntil);
+              for (const d of room.padReservedUntil) if (d) deadlines.push(d);
+              const wait = Math.min(...deadlines) - Date.now();
+              this._alarm = setTimeout(() => this.alarm(), Math.max(1000, wait));
+            }
+            alarm() {
+              const room = this.record;
+              if (!room) return;
+              const now = Date.now();
+              const expiresAt = room.expiresAt || room.createdAt + ONLINE_ROOM_TTL_MS;
+              let reason = "";
+              if (room.hostReservedUntil && now >= room.hostReservedUntil) {
+                if (!this.find("host")) reason = "host-left";
+                else room.hostReservedUntil = 0;
+              }
+              if (!reason && now >= expiresAt) reason = "room-expired";
+              if (reason) {
+                this.broadcast({ t: "closed", reason });
+                for (const ws of [...this.sockets.keys()]) try { ws.close(4004, reason); } catch {}
+                this.record = null;
+                this.service.rooms.delete(this.code);
+                return;
+              }
+              this.scheduleAlarm();
+            }
+          }
+
+          class OnlineService {
+            constructor() {
+              this.rooms = new Map();
+              this.server = http.createServer((req, res) => this._handleHttp(req, res));
+              this.server.on("upgrade", (req, socket, head) => this._handleUpgrade(req, socket, head));
+            }
+            listen() {
+              this.server.listen(PORT, () => console.log(`[online] room service listening on :${PORT} (http /create + ws /connect)`));
+            }
+            _sendJson(res, out) {
+              res.writeHead(out.status, out.headers);
+              res.end(out.body);
+            }
+            async _readSmallJson(req) {
+              const chunks = [];
+              let size = 0;
+              for await (const c of req) { size += c.length; if (size > MAX_JSON_BYTES) throw new Error("body-too-large"); chunks.push(c); }
+              const text = Buffer.concat(chunks).toString("utf8");
+              if (text.length > MAX_JSON_BYTES) throw new Error("body-too-large");
+              return JSON.parse(text || "{}");
+            }
+            async _handleHttp(req, res) {
+              const url = new URL(req.url, `http://${req.headers.host}`);
+              const origin = req.headers.origin || "*";
+              const reply = (out) => this._sendJson(res, out);
+              if (req.method === "GET" && url.pathname === "/health") return reply(json({ ok: true }, 200, origin));
+              if (!originAllowed(origin)) return reply(json({ ok: false, reason: "origin" }, 403, origin));
+              if (req.method === "OPTIONS") { res.writeHead(204, cors(origin)); return res.end(); }
+              if (req.method === "POST" && url.pathname === "/create") {
+                let body;
+                try { body = await this._readSmallJson(req); } catch (e) {
+                  return reply(json({ ok: false, reason: e.message || "bad-json" }, 400, origin));
+                }
+                const config = normalizeOnlineConfig(body && body.config);
+                for (let attempt = 0; attempt < 8; attempt++) {
+                  const room = randomCode();
+                  const hostToken = randomToken();
+                  const padInvites = [randomToken(), randomToken()];
+                  const r = new Room(room, this);
+                  const status = r.createRoom({ room, hostToken, padInvites, config });
+                  if (status === 201) {
+                    this.rooms.set(room, r);
+                    return reply(json({ ok: true, room, hostToken, padInvites, config }, 201, origin));
+                  }
+                }
+                return reply(json({ ok: false, reason: "create-collision" }, 503, origin));
+              }
+              if (req.method === "GET" && url.pathname === "/connect") {
+                return reply(json({ ok: false, reason: "upgrade-required" }, 426, origin));
+              }
+              return reply(json({ ok: false, reason: "not-found" }, 404, origin));
+            }
+            _handleUpgrade(req, socket, head) {
+              const url = new URL(req.url, `http://${req.headers.host}`);
+              const origin = req.headers.origin || "*";
+              const fail = (code, reason) => {
+                try { socket.write(`HTTP/1.1 ${code} ${reason}\r\n\r\n`); socket.destroy(); } catch {}
+              };
+              if (url.pathname !== "/connect") return fail(404, "not-found");
+              if (!originAllowed(origin)) return fail(403, "origin");
+              const room = normalizeRoomCode(url.searchParams.get("room"));
+              if (room.length !== ONLINE_ROOM_CODE_LENGTH) return fail(400, "room");
+              const r = this.rooms.get(room);
+              if (!r) { fail(400, "no-room"); return; }
+              acceptWebSocket(req, socket, head, (ws) => r.addSocket(ws), (ws) => r.onClose(ws));
+            }
+          }
+
+          const service = new OnlineService();
+          service.listen();
+          SERVEREOS
+
           echo "=== 已生成构建文件 ==="
-          ls -la build-context/Dockerfile build-context/.dockerignore build-context/docker/start.mjs
+          ls -la build-context/Dockerfile build-context/.dockerignore build-context/docker/start.mjs build-context/online/server.mjs build-context/online/shared.js
 
       # 设置 QEMU (跨架构构建)
       - name: 设置 QEMU
