@@ -262,6 +262,7 @@ jobs:
           //   SW_PRECACHE_DELAY_MS  SW 预缓存启动延迟       默认 5000 (设 "0" 不延迟)
           //   SW_PRECACHE_BATCH     SW 预缓存每批并发数     默认 2
           //   SW_PRECACHE_GAP_MS    SW 预缓存批间隔         默认 400
+          //   CHUNK_INTEGRITY_CHECK 启动时校验 chunk 语法   默认 true (设 "false" 跳过)
           //
           // 用法：docker run ... --entrypoint node 镜像 docker/start.mjs
           //       或在 docker-compose 里 entrypoint: ["node","docker/start.mjs"]
@@ -469,6 +470,35 @@ jobs:
             console.log(`[start] sw.js precache throttled: delay=${delay}ms batch=${batch} gap=${gap}ms skip-cached=on`);
           }
 
+          // ---- 2d. 校验 .next 静态 chunk 完整性（让静默损坏在部署日志里现形） ----------
+          // 背景：出现过"构建/分发链路静默产出损坏 chunk"——文件名 hash 不变、构建退出
+          // 码 0、但内容语法不合法；浏览器把坏副本按 immutable 永久缓存，极难排查。
+          // 这里在容器启动时用 vm.Script 对每个 chunk 做一次语法解析（只编译不执行），
+          // 损坏即在日志里大声报出。只检测不修复（修不了，需重新构建镜像）。
+          async function checkChunkIntegrity() {
+            if ((process.env.CHUNK_INTEGRITY_CHECK ?? "true") === "false") return;
+            const base = path.join(APP_DIR, ".next", "static");
+            let files = [];
+            try { files = await walkJs(base); } catch { return; }
+            if (!files.length) return;
+            const { default: vm } = await import("node:vm");
+            const bad = [];
+            for (const f of files) {
+              try {
+                const code = await readFile(f, "utf8");
+                new vm.Script(code, { filename: f });
+              } catch (e) {
+                bad.push(`${path.relative(APP_DIR, f)}: ${e.message}`);
+              }
+            }
+            if (bad.length) {
+              console.error(`[start] !!!!!! ${bad.length} CORRUPTED chunk(s) in image — 镜像构建产物损坏，需重新构建:`);
+              for (const b of bad.slice(0, 20)) console.error("[start]   x", b);
+            } else {
+              console.log(`[start] chunk integrity OK (${files.length} js files parsed)`);
+            }
+          }
+
           // ---- 3. 拉起子进程（Web + relay）-----------------------------------------
           const children = [];
           function run(cmd, args, opts = {}) {
@@ -502,6 +532,7 @@ jobs:
             await generateRuntime();       // 1. 生成浏览器 Shim
             await patchLobbyChunks();      // 2. 改写编译产物 chunk（二维码链接优先用 WEB_PUBLIC_URL）
             await patchServiceWorker();    // 2c. 节流 SW 预缓存（避免首屏白屏）
+            await checkChunkIntegrity();   // 2d. 校验 chunk 完整性（含上面 patch 过的 chunk）
             const relay = await prepareRelay(); // 3. 生成 patch 后的 relay 副本
 
             // Web 服务
