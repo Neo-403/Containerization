@@ -16,7 +16,8 @@
 #   - schedule 定时: 每天 UTC 02:00 自动构建并推送 latest 标签
 #   - workflow_dispatch 手动: 手动触发构建并推送
 #
-# 多平台: 默认 linux/amd64,linux/arm64 (由 env.PLATFORMS 覆盖)
+# 平台: 默认仅 linux/amd64 (由 env.PLATFORMS 覆盖)。⚠ 勿加 arm64 —— CI 用
+#   QEMU 模拟构建 next build 会静默产出损坏的 chunk (文件名 hash 不变但内容坏)。
 #
 # 推送目标 (固定推 Docker Hub + GHCR, 均打 latest / <package.json version>):
 #   - Docker Hub : <DOCKERHUB_USERNAME>/<IMAGE_NAME>   (需 Secrets: DOCKERHUB_USERNAME / DOCKERHUB_TOKEN)
@@ -60,9 +61,10 @@ env:
   UPSTREAM_REPO: 'animal-world-cup'
   # ⭐构建的镜像名称(自定义需要构建的镜像名称)
   IMAGE_NAME: 'animal-world-cup'
-  # ⭐多平台列表: buildx 从源码原生构建, 非本机架构用 QEMU 模拟。
-  #   要增删平台直接改这一行 (如 'linux/amd64,linux/arm64,linux/arm/v7')。
-  PLATFORMS: linux/amd64,linux/arm64
+  # ⭐平台列表: 只构建 linux/amd64 (NAS 即 amd64, 原生构建无需 QEMU)。
+  #   ⚠ 不要加 linux/arm64: CI runner 是 x86_64, arm64 只能走 QEMU 模拟,
+  #   而 QEMU 模拟下 next build 会非确定性地产出损坏 chunk (构建不报错)。
+  PLATFORMS: linux/amd64
   # ⭐构建开关: 不再在全局写死, 而是由下方矩阵(check 任务生成的 matrix)按变体注入:
   #   BUILD_SERVER  是否内置联机服务器 @noname/server
   #   BUILD_FRONTEND 是否内置前端静态服务 @noname/fs
@@ -257,6 +259,9 @@ jobs:
           //   ONLINE_PORT        公网房间服务端口          默认 13002
           //   ENABLE_ONLINE      是否启用公网房间服务       默认 true (设 "false" 关闭)
           //   ALLOWED_ORIGINS    允许跨域的 Origin(逗号分隔) 默认不限制(*)
+          //   SW_PRECACHE_DELAY_MS  SW 预缓存启动延迟       默认 5000 (设 "0" 不延迟)
+          //   SW_PRECACHE_BATCH     SW 预缓存每批并发数     默认 2
+          //   SW_PRECACHE_GAP_MS    SW 预缓存批间隔         默认 400
           //
           // 用法：docker run ... --entrypoint node 镜像 docker/start.mjs
           //       或在 docker-compose 里 entrypoint: ["node","docker/start.mjs"]
@@ -423,6 +428,47 @@ jobs:
             else console.log("[start] NOTE: lobby join-URL chunk not found/patched (WEB_PUBLIC_URL will be ignored by client)");
           }
 
+          // ---- 2c. patch public/sw.js（节流 SW 预缓存，避免首屏长时间白屏） -------------
+          // 原 sw.js 在 install 时立即以 20 并发预缓存全部 ~900 个游戏资源。部署在
+          // 高 TTFB 主机 (NAS, ~1s/请求) 上时，浏览器对每个源只有 6 条 HTTP/1.1 连接，
+          // 预缓存洪流瞬间占满连接池，页面自身的 JS chunk 全部排队 → 部署后首屏长时间
+          // 空白，直到预缓存完成才"突然变快"。这里把预缓存改为：延迟启动 + 小批量 +
+          // 批间隔 + 已缓存则跳过，让它只在后台慢跑，把首屏窗口让给页面自身资源。
+          async function patchServiceWorker() {
+            const swPath = path.join(PUBLIC_DIR, "sw.js");
+            let src;
+            try { src = await readFile(swPath, "utf8"); } catch { return; }
+            // 幂等：已 patch 过（含标记注释）则跳过，避免容器重启后重复包裹
+            if (src.includes("/* precache-throttled */")) {
+              console.log("[start] sw.js already throttled, skip");
+              return;
+            }
+            const delay = Number(process.env.SW_PRECACHE_DELAY_MS ?? 5000);
+            const batch = Number(process.env.SW_PRECACHE_BATCH ?? 2);
+            const gap = Number(process.env.SW_PRECACHE_GAP_MS ?? 400);
+            const pats = [
+              /const batchSize = \d+;/,
+              /\)\.then\(nextBatch\);/,
+              /return nextBatch\(\);/,
+              /fetch\(url\)\.then\(\(response\) => \{/,
+            ];
+            if (!pats.every((p) => p.test(src))) {
+              console.log("[start] NOTE: sw.js precache pattern not found, skip throttling");
+              return;
+            }
+            let out = src;
+            // 1) 降低单批并发 20 -> batch
+            out = out.replace(pats[0], `const batchSize = ${batch}; /* precache-throttled */`);
+            // 2) 批次之间插入间隔，避免长时间占满连接池
+            out = out.replace(pats[1], `).then(() => new Promise((r) => setTimeout(r, ${gap})).then(nextBatch));`);
+            // 3) 预缓存延迟启动，把首屏加载窗口让给页面自身资源
+            out = out.replace(pats[2], `return new Promise((r) => setTimeout(r, ${delay})).then(nextBatch);`);
+            // 4) 已在缓存中的 URL 直接跳过，避免 SW 更新后重复全量下载
+            out = out.replace(pats[3], `cache.match(url).then((hit) => hit || fetch(url)).then((response) => {`);
+            await writeFile(swPath, out, "utf8");
+            console.log(`[start] sw.js precache throttled: delay=${delay}ms batch=${batch} gap=${gap}ms skip-cached=on`);
+          }
+
           // ---- 3. 拉起子进程（Web + relay）-----------------------------------------
           const children = [];
           function run(cmd, args, opts = {}) {
@@ -455,6 +501,7 @@ jobs:
           async function main() {
             await generateRuntime();       // 1. 生成浏览器 Shim
             await patchLobbyChunks();      // 2. 改写编译产物 chunk（二维码链接优先用 WEB_PUBLIC_URL）
+            await patchServiceWorker();    // 2c. 节流 SW 预缓存（避免首屏白屏）
             const relay = await prepareRelay(); // 3. 生成 patch 后的 relay 副本
 
             // Web 服务
@@ -1053,9 +1100,7 @@ jobs:
           echo "=== 已生成构建文件 ==="
           ls -la build-context/Dockerfile build-context/.dockerignore build-context/docker/start.mjs build-context/online/server.mjs build-context/online/shared.js
 
-      # 设置 QEMU (跨架构构建)
-      - name: 设置 QEMU
-        uses: docker/setup-qemu-action@v3
+      # (已移除 QEMU 设置步骤: 只构建 amd64, 原生构建无需跨架构模拟)
 
       # 设置 Docker Buildx
       - name: 设置 Docker Buildx
