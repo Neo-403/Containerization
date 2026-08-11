@@ -30,7 +30,7 @@ permissions:  # 工作流权限
 env:
   # ---------- Git 仓库配置 ----------
   REPO_URL: https://github.com/woniu9524/couple-flying-chess
-  REPO_BRANCH: main  # 分支或 tag，留空则使用默认分支
+  REPO_BRANCH:   # 分支或 tag，留空则使用默认分支
   PROJECT_SUBDIR: .  # 项目子目录，留空或使用 . 表示根目录
   # ---------- 镜像配置 ----------
   DOCKERHUB_USERNAME: 918178 # 推送的Docker Hub 用户名(若secrets中有DOCKERHUB_USERNAME则会被覆盖)
@@ -59,7 +59,14 @@ jobs:  # 工作流作业
         run: |
           # 从 URL 提取 owner/repo
           REPO_PATH=$(echo "${{ env.REPO_URL }}" | sed -E 's|https?://[^/]+/([^/]+/[^/.]+)(\\.git)?$|\\1|')
-          git clone --depth 1 --branch ${{ env.REPO_BRANCH || 'main' }} ${{ env.REPO_URL }} .
+          # 留空 REPO_BRANCH 则克隆默认分支；否则按指定分支/tag 克隆
+          if [ -n "${{ env.REPO_BRANCH }}" ]; then
+            echo "📌 按指定分支/tag 克隆: ${{ env.REPO_BRANCH }}"
+            git clone --depth 1 --branch ${{ env.REPO_BRANCH }} ${{ env.REPO_URL }} .
+          else
+            echo "📌 REPO_BRANCH 留空，克隆默认分支"
+            git clone --depth 1 ${{ env.REPO_URL }} .
+          fi
 
       # ========== 环境准备 ==========
       # 设置QEMU，用于构建多平台镜像
@@ -171,8 +178,10 @@ jobs:  # 工作流作业
           fi
 
           cat > Dockerfile << 'EOF'
-          # ---------- 阶段 1：构建 ----------
-          FROM node:20-alpine AS builder
+          # ---------- 阶段 1：构建（固定 amd64）----------
+          # 纯静态产物与架构无关，强制在构建机平台(amd64)编译一次即可，
+          # 避免 arm64/arm 在 QEMU 模拟下因 node 二进制触发 Illegal instruction 崩溃。
+          FROM --platform=$BUILDPLATFORM node:20-alpine AS builder
           WORKDIR /app
           # 优先拷贝依赖清单以利用层缓存
           COPY ${PROJECT_PATH}/package.json ${PROJECT_PATH}/pnpm-lock.yaml ./
@@ -182,12 +191,13 @@ jobs:  # 工作流作业
           # 拷贝源码并构建
           COPY ${PROJECT_PATH} .
           RUN pnpm build
-          # ---------- 阶段 2：运行 ----------
-          # 使用指定的基础镜像
+          # ---------- 阶段 2：运行（跟随目标平台）----------
+          # 使用指定的多架构基础镜像（nginx:alpine 自带 amd64/arm64/arm 各平台 manifest），
+          # 每个目标平台只做 COPY 静态文件，不跑 node，彻底绕开 QEMU 崩溃。
           FROM ${{ env.BASE_IMAGE }}
           # 设置工作目录
           WORKDIR ${{ env.WORKDIR }}
-          # 复制项目文件
+          # 复制项目文件（来自 amd64 构建的产物）
           COPY --from=builder /app/dist /usr/share/nginx/html
           # 修复子路径部署问题：
           # 把 index.html 中绝对资源路径 (/assets/...) 改为相对路径 (./assets/...)，
