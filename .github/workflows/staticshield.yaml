@@ -145,26 +145,25 @@ jobs:  # 工作流作业
 
       # ========== 生成镜像标签 ==========
       # 生成镜像标签
-      # 注意：images/tags 的表达式在 step 执行前展开，只能引用 job 级已知的
-      # secrets / env / github 上下文，不能引用后续 step 才写入的 $GITHUB_ENV 变量
-      # （如 DOCKERHUB_USERNAME_FINAL、TAG_NAME），否则会报
-      # "Context access might be invalid" 且取值为空。
       - name: 生成镜像标签
         id: meta  # 步骤 ID,用于后续引用
         uses: docker/metadata-action@v5
         with:
           # 同时指定Docker Hub和GHCR的镜像名称
-          # Docker Hub 用户名优先用 secrets，否则用 env.DOCKERHUB_USERNAME（均为 job 级已知上下文）
           images: |
-            ${{ (secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_USERNAME || env.DOCKERHUB_USERNAME) }}/${{ env.IMAGE_NAME }}
+            ${{ env.DOCKERHUB_USERNAME_FINAL }}/${{ env.IMAGE_NAME }}
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           # 默认的 latest 标签行为,可由下面的 tags 规则精确控制
           flavor: |
             latest=false
-          # 标签规则,根据环境变量与事件类型生成标签（不使用运行期才写入的 TAG_NAME）
+          # 标签规则,根据事件类型和输入参数生成标签
           tags: |
-            # 自定义标签：CUSTOM_TAG 非空且非 latest 时作为独立标签
-            type=raw,value=${{ env.CUSTOM_TAG }},enable=${{ env.CUSTOM_TAG != '' && env.CUSTOM_TAG != 'latest' }}
+            # 使用环境变量中的标签名称
+            type=raw,value=${{ env.TAG_NAME }}
+            # # 使用Git提交的短哈希值
+            # type=raw,value=${{ steps.git-info.outputs.sha_short }}
+            # # 使用分支名称作为标签,启用条件：当前Git引用等于指定的分支名称
+            # type=raw,value=${{ steps.git-info.outputs.branch }},enable=${{ github.ref == format('refs/heads/{0}', steps.git-info.outputs.branch) }}
             # 使用 'latest' 作为标签,启用条件：当前事件类型为'release'或'workflow_dispatch'
             type=raw,value=latest,enable=${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
 
