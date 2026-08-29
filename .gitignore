@@ -1,0 +1,8 @@
+# CodeBuddy 本地工作目录
+# 存放 AI 的工作记忆与临时数据,仅本地使用,不提交到仓库
+.codebuddy/
+
+# 工作流在本地运行时可能生成的产物(限定仓库根目录,避免误伤子目录同名文件)
+/Dockerfile
+/.dockerignore
+/*.tar

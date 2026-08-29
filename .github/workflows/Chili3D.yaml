@@ -5,8 +5,9 @@ on:  # 定义触发工作流的事件
   #   types: [ published ]  # 当发布新的GitHub release时触发
   workflow_dispatch:  # 手动触发
   schedule:  # 定时触发
-    # 每周天 UTC 时间 00:00 运行 (Cron 语法 分、时、日、月、周)
-    - cron: '0 0 * * 7'
+    # 每周日 UTC 时间 00:00 运行 (Cron 语法:分 时 日 月 周)
+    # 注意: GitHub 的周字段只接受 0-6 或 SUN-SAT,0 和 SUN 都表示周日(写 7 会报错)
+    - cron: '0 0 * * 0'
   # workflow_run:
   #   workflows: ["GoReleaser Workflow"]  # 指定工作流完成时触发
   #   types: [completed]  # 当工作流完成时触发
