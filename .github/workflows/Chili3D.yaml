@@ -1,0 +1,362 @@
+name: 构建 Chili3D(在线3D CAD)_Docker镜像  # ⭐Actions名称,docker
+
+on:  # 定义触发工作流的事件
+  # release:  # 当发布新的GitHub release时触发
+  #   types: [ published ]  # 当发布新的GitHub release时触发
+  workflow_dispatch:  # 手动触发
+  schedule:  # 定时触发
+    # 每周天 UTC 时间 00:00 运行 (Cron 语法 分、时、日、月、周)
+    - cron: '0 0 * * 7'
+  # workflow_run:
+  #   workflows: ["GoReleaser Workflow"]  # 指定工作流完成时触发
+  #   types: [completed]  # 当工作流完成时触发
+  # push:
+  #   branches: [ "main", "master" ]  # 当指定分支有代码推送时触发
+  # pull_request:
+  #   branches: [ "main", "master" ]  # 当指定分支有代码拉取请求时触发
+
+permissions:  # 工作流权限
+  contents: read  # 工作流需要读取仓库内容的权限
+  packages: write  # 工作流需要推送包到 GitHub Container Registry 的权限
+
+# ============================================
+# 🔧 ⭐配置区域 - 在这里修改变量即可复用
+# ============================================
+env:
+  # ---------- Git 仓库配置 ----------
+  REPO_URL: https://github.com/xiangechen/chili3d
+  REPO_BRANCH:   # 分支或 tag,留空则使用默认分支
+  PROJECT_SUBDIR: .  # 项目子目录,留空或使用 . 表示根目录
+  # ---------- 镜像配置 ----------
+  DOCKERHUB_USERNAME: 918178 # 推送的Docker Hub 用户名(若secrets中有DOCKERHUB_USERNAME则会被覆盖)
+  IMAGE_NAME: chili3d  # 镜像名称
+  CUSTOM_TAG: latest  # 自定义标签,仅当 TAGS_SELECT 含 custom 时生效(为 latest 时跳过)
+  EXPORT_TAR: false  # 是否导出tar包(true/false)
+  # ---------- Release 版本配置 ----------
+  USE_LATEST_RELEASE: true  # 是否获取 releases 中最新发布版本(true/false)
+  CHECKOUT_RELEASE_TAG: true  # 是否按获取到的最新 release tag 检出代码(需 USE_LATEST_RELEASE=true)
+  # ---------- 镜像标签选择 ----------
+  # ⭐镜像标签选择变量:唯一决定推送哪些标签,逗号分隔,可多选,顺序即标签生成顺序
+  #   可选值:
+  #     version - 最新 release 版本号(去掉 v 前缀,如 0.8.0),需 USE_LATEST_RELEASE=true
+  #     tag     - 最新 release 完整 tag(如 v0.8.0),需 USE_LATEST_RELEASE=true
+  #     date    - 日期标签(如 20260829)
+  #     sha     - Git 提交的短哈希值
+  #     branch  - Git 分支名
+  #     custom  - 自定义标签 CUSTOM_TAG(为 latest 时跳过)
+  #     latest  - latest 标签
+  #   说明: 首个生效的标签即主标签 TAG_NAME(tar 导出与构建信息使用);
+  #         手动触发时填写的 tag 会额外追加到末尾;以上均未生成时回落日期标签
+  TAGS_SELECT: tag,latest
+  # ---------- 构建配置 ----------
+  PLATFORMS: linux/amd64  # 构建平台,多平台用逗号分隔,如：linux/amd64,linux/arm64/v8,linux/arm/v7
+  # PLATFORMS: linux/amd64,linux/386,linux/arm64/v8,linux/arm/v7,linux/arm/v6  # 全平台示例
+# ============================================
+
+# 可以有多个工作流,多个工作流依次运行
+# 一个工作流运行由一个或多个作业组成,这些作业可以顺序或并行运行
+jobs:  # 工作流作业
+  image:  # 作业名称,唯一标识
+    name: 从 Dockerfile 构建映像  # 工作流作业名称
+    runs-on: ubuntu-latest  # 在最新的Ubuntu环境中运行
+    steps:  # 工作流步骤
+
+      # ========== 获取最新版本 ==========
+      # 从 releases 中获取最新发布的版本(获取失败不阻断,自动回落到日期标签)
+      - name: 获取最新 Release 版本
+        id: latest-release
+        run: |
+          # 从 URL 提取 owner/repo(如 xiangechen/chili3d)
+          REPO_PATH=$(echo "${{ env.REPO_URL }}" | sed -E 's|https?://[^/]+/([^/]+/[^/.]+)(\.git)?$|\1|')
+          echo "📦 目标仓库: ${REPO_PATH}"
+
+          # 生效值：手动输入 > env
+          USE_RELEASE="${{ env.USE_LATEST_RELEASE }}"
+          if [ -n "${{ github.event.inputs.use_latest_release }}" ] && [ "${{ github.event.inputs.use_latest_release }}" != "default" ]; then
+            USE_RELEASE="${{ github.event.inputs.use_latest_release }}"
+          fi
+
+          if [ "$USE_RELEASE" != "true" ]; then
+            echo "ℹ️ USE_LATEST_RELEASE 未开启,跳过获取最新 Release"
+            exit 0
+          fi
+
+          LATEST_TAG=$(curl -sL --retry 3 "https://api.github.com/repos/${REPO_PATH}/releases/latest" | jq -r '.tag_name // empty')
+          if [ -z "$LATEST_TAG" ]; then
+            echo "⚠️ 未获取到最新 Release(仓库无 release 或接口受限),回落到日期标签"
+            exit 0
+          fi
+          # 去掉 tag 前缀 v,得到纯版本号(v0.8.0 -> 0.8.0)
+          VERSION="${LATEST_TAG#v}"
+          echo "🎉 最新 Release: ${LATEST_TAG}(版本号: ${VERSION})"
+          echo "tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "LATEST_RELEASE_TAG=${LATEST_TAG}" >> $GITHUB_ENV
+          echo "LATEST_RELEASE_VERSION=${VERSION}" >> $GITHUB_ENV
+
+      # ========== 代码检出 ==========
+      - name: 克隆项目代码
+        run: |
+          # 从 URL 提取 owner/repo
+          REPO_PATH=$(echo "${{ env.REPO_URL }}" | sed -E 's|https?://[^/]+/([^/]+/[^/.]+)(\.git)?$|\1|')
+          # 确定检出的分支/tag:最新 release tag(CHECKOUT_RELEASE_TAG=true) > REPO_BRANCH > 默认分支
+          REF="${{ env.REPO_BRANCH }}"
+          if [ "${{ env.CHECKOUT_RELEASE_TAG }}" = "true" ] && [ -n "${{ steps.latest-release.outputs.tag }}" ]; then
+            REF="${{ steps.latest-release.outputs.tag }}"
+          fi
+          # 留空则克隆默认分支;否则按指定分支/tag 克隆
+          if [ -n "$REF" ]; then
+            echo "📌 按指定分支/tag 克隆: ${REF}"
+            git clone --depth 1 --branch "${REF}" ${{ env.REPO_URL }} .
+          else
+            echo "📌 REF 留空,克隆默认分支"
+            git clone --depth 1 ${{ env.REPO_URL }} .
+          fi
+
+      # ========== 环境准备 ==========
+      # 设置QEMU,用于构建多平台镜像
+      - name: 设置 QEMU  # 步骤名称
+        uses: docker/setup-qemu-action@v3  # 引用流程
+
+      # 设置Docker Buildx,用于构建和推送多平台镜像
+      - name: 设置 Docker Buildx  # 步骤名称
+        uses: docker/setup-buildx-action@v3  # 引用流程
+        with:  # 参数
+          # 使用host网络,避免网络问题
+          driver-opts: |
+            network=host
+          buildkitd-flags: --debug  # 启用调试模式
+
+      # ========== 获取版本信息 ==========
+      # 获取当前日期(格式：年月日,如 20251009)
+      - name: 获取当前日期
+        id: get-date
+        run: echo "date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: 获取 Git 信息
+        id: git-info
+        run: |
+          # 获取短 SHA
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          # 获取当前分支名
+          echo "branch=$(git rev-parse --abbrev-ref HEAD)" >> $GITHUB_OUTPUT
+
+      # ========== 处理变量 ==========
+      # 处理用户名优先级：secrets > env
+      - name: 处理用户名
+        id: set-username
+        run: |
+          # 优先使用secrets中的DOCKERHUB_USERNAME
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            echo "DOCKERHUB_USERNAME_FINAL=${{ secrets.DOCKERHUB_USERNAME }}" >> $GITHUB_ENV
+            echo "✅ 使用 secrets.DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}"
+          else
+            echo "DOCKERHUB_USERNAME_FINAL=${{ env.DOCKERHUB_USERNAME }}" >> $GITHUB_ENV
+            echo "✅ 使用 env.DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}"
+          fi
+
+      # ========== 确定镜像标签 ==========
+      # 按 TAGS_SELECT 生成实际推送的标签规则,首个标签即主标签 TAG_NAME(tar 导出、构建信息使用)
+      - name: 确定镜像标签  # 步骤名称
+        id: set-tag
+        run: |
+          # 生效值：手动输入 > env
+          SELECT="${{ github.event.inputs.tags_select }}"
+          if [ -z "$SELECT" ]; then
+            SELECT="${{ env.TAGS_SELECT }}"
+          fi
+          echo "🏷️ 选中的标签类型: ${SELECT}"
+
+          VER="${{ steps.latest-release.outputs.version }}"
+          REL_TAG="${{ steps.latest-release.outputs.tag }}"
+          TAGS_FILE=$(mktemp)
+
+          echo "$SELECT" | tr ',' '\n' | while read -r item; do
+            # 去除首尾空白
+            item="$(echo "$item" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            case "$item" in
+              ''|\#*) continue ;;
+              latest)
+                echo "type=raw,value=latest" >> "$TAGS_FILE" ;;
+              custom)
+                if [ -n "${{ env.CUSTOM_TAG }}" ] && [ "${{ env.CUSTOM_TAG }}" != "latest" ]; then
+                  echo "type=raw,value=${{ env.CUSTOM_TAG }}" >> "$TAGS_FILE"
+                else
+                  echo "ℹ️ custom 标签跳过: CUSTOM_TAG 为空或 latest"
+                fi
+                ;;
+              version)
+                if [ -n "$VER" ]; then
+                  echo "type=raw,value=${VER}" >> "$TAGS_FILE"
+                else
+                  echo "ℹ️ version 标签跳过: 未获取到最新 release"
+                fi
+                ;;
+              tag)
+                if [ -n "$REL_TAG" ]; then
+                  echo "type=raw,value=${REL_TAG}" >> "$TAGS_FILE"
+                else
+                  echo "ℹ️ tag 标签跳过: 未获取到最新 release"
+                fi
+                ;;
+              date)
+                echo "type=raw,value=${{ steps.get-date.outputs.date }}" >> "$TAGS_FILE" ;;
+              sha)
+                echo "type=raw,value=${{ steps.git-info.outputs.sha_short }}" >> "$TAGS_FILE" ;;
+              branch)
+                echo "type=raw,value=${{ steps.git-info.outputs.branch }},enable=${{ github.ref == format('refs/heads/{0}', steps.git-info.outputs.branch) }}" >> "$TAGS_FILE" ;;
+              *)
+                echo "⚠️ 未知标签类型: ${item}(已忽略)" ;;
+            esac
+          done
+
+          # 手动触发时填写的 tag 额外追加
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "type=raw,value=${{ github.event.inputs.tag }}" >> "$TAGS_FILE"
+          fi
+
+          # 兜底：以上均未生成任何标签时使用日期标签
+          if [ ! -s "$TAGS_FILE" ]; then
+            echo "⚠️ 未生成任何标签,回落到日期标签"
+            echo "type=raw,value=${{ steps.get-date.outputs.date }}" >> "$TAGS_FILE"
+          fi
+
+          # 主标签 = 首个生成的标签(去掉 type=raw,value= 前缀与 enable= 后缀)
+          TAG=$(head -n1 "$TAGS_FILE" | sed -E 's/^type=raw,value=//; s/,enable=.*$//')
+          echo "📌 主标签: ${TAG}"
+          echo "TAG_NAME=${TAG}" >> $GITHUB_ENV
+          echo "tag_name=${TAG}" >> $GITHUB_OUTPUT
+
+          echo "生成的标签规则:"
+          cat "$TAGS_FILE"
+          {
+            echo "tags<<TAGS_EOF"
+            cat "$TAGS_FILE"
+            echo "TAGS_EOF"
+          } >> $GITHUB_OUTPUT
+
+      # ========== 登录镜像仓库 ==========
+      # 登录到 Docker Hub
+      - name: 登录 DockerHub  # 步骤名称
+        uses: docker/login-action@v3  # 引用流程
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME_FINAL }}  # Docker Hub 用户名(优先使用secrets)
+          password: ${{ secrets.DOCKERHUB_TOKEN }}  # Docker Hub Token(需在secrets中配置)
+        continue-on-error: false  # 登录失败时抛出错误
+
+      # 登录到 GitHub Container Registry
+      - name: 登录 GitHub Container Registry  # 步骤名称
+        uses: docker/login-action@v3  # 引用流程
+        with:
+          registry: ghcr.io  # GitHub Container Registry 地址
+          username: ${{ github.actor }}  # GitHub 用户名(自动获取当前用户)
+          password: ${{ secrets.GITHUB_TOKEN }}  # GitHub Token(无需配置,由 GitHub 提供)
+        continue-on-error: false  # 登录失败时抛出错误
+
+      # ========== 生成镜像标签 ==========
+      # 生成镜像标签
+      - name: 生成镜像标签
+        id: meta  # 步骤 ID,用于后续引用
+        uses: docker/metadata-action@v5
+        with:
+          # 同时指定Docker Hub和GHCR的镜像名称
+          images: |
+            ${{ env.DOCKERHUB_USERNAME_FINAL }}/${{ env.IMAGE_NAME }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          # 默认的 latest 标签行为,由上面的 set-tag 步骤通过 TAGS_SELECT 精确控制
+          flavor: |
+            latest=false
+          # 可用标签类型见 env.TAGS_SELECT 说明(version/tag/date/sha/branch/custom/latest)
+          tags: ${{ steps.set-tag.outputs.tags }}
+
+      # ========== 创建文件流程放在这里 ==========
+
+      # ========== 构建并推送镜像 ==========
+      # 构建并推送镜像(可同时推送多个镜像,多个镜像平台)
+      - name: 编译并推送 ${{ env.IMAGE_NAME }}镜像  # 步骤名称
+        uses: docker/build-push-action@v5  # 引用流程
+        with:  # 参数
+          context: .  # 构建上下文
+          file: ./Dockerfile  # 指定的Dockerfile
+          platforms: ${{ env.PLATFORMS }}  # 构建的平台
+          push: true  # 推送到仓库
+          # load: true  # 加载到本地(多构建平台不支持;若其它也需调用镜像则必须加载,如打包导出)
+          # 注意 | 后注释会有问题故放在这
+          # 传递构建参数(覆盖 ARG ${{ github.event.repository.name }}_VERSION=3.5.0 配置参数)
+          # build-args: |
+          #   ${{ github.event.repository.name }}_VERSION=${{ env.TAG_NAME }}
+          # 注意 | 后注释会有问题故放在这
+          # 推送的镜像标签(版本标签+latest)
+          # tags: |  # 使用手动指定标签
+          #   ${{ env.TAG }}
+          #   ${{ env.TAG_LATEST }}
+          tags: ${{ steps.meta.outputs.tags }}  # 使用metadata-action生成的标签
+          labels: ${{ steps.meta.outputs.labels }}  # 使用metadata-action生成的标签
+          cache-from: type=gha  # 使用GitHub Action缓存
+          cache-to: type=gha,mode=max  # 使用GitHub Action缓存
+
+      # ========== 导出 tar 包 ==========
+      # 镜像打包为tar包
+      - name: 镜像打包为tar包  # 步骤名称
+        if: env.EXPORT_TAR == 'true'
+        # 注意 | 后注释会有问题故放在这
+        # 运行的具体指令,每行指令依次运行
+        run: |
+          # 获取第一个平台镜像
+          FIRST_PLATFORM=$(echo "${{ env.PLATFORMS }}" | cut -d',' -f1)
+          docker pull --platform ${FIRST_PLATFORM} ${{ env.DOCKERHUB_USERNAME_FINAL }}/${{ env.IMAGE_NAME }}:${{ env.TAG_NAME }}
+          docker save -o ${{ env.IMAGE_NAME }}.tar ${{ env.DOCKERHUB_USERNAME_FINAL }}/${{ env.IMAGE_NAME }}:${{ env.TAG_NAME }}
+          ls -lh ${{ env.IMAGE_NAME }}.tar
+          echo "✅ tar 包创建完成"
+
+      # 将构建好的镜像导出为tar包
+      - name: Archive 导出内部文件  # 步骤名称
+        if: env.EXPORT_TAR == 'true'
+        uses: actions/upload-artifact@v4  # 引用流程
+        with:  # 参数
+          name: ${{ env.IMAGE_NAME }}.tar  # 导出的文件名称
+          path: ${{ env.IMAGE_NAME }}.tar  # 导出的文件路径
+          retention-days: 1  # 保留 1 天
+
+      # ========== 清理缓存 ==========
+      - name: 清理 Docker 缓存
+        if: always()
+        run: |
+          docker builder prune -f
+          docker system prune -f --volumes
+
+      # ========== 输出构建信息 ==========
+      # 输出构建信息
+      - name: 输出构建信息
+        env:
+          PUSHED_TAGS: ${{ steps.meta.outputs.tags }}  # 多行标签列表,用环境变量传递避免换行破坏脚本
+        run: |
+          echo "=========================================="
+          echo "✅ 镜像构建并推送成功！"
+          echo "=========================================="
+          echo "📦 项目: ${{ env.REPO_URL }}"
+          echo "🌿 分支: ${{ env.REPO_BRANCH || 'default' }}"
+          echo "📂 子目录: ${{ env.PROJECT_SUBDIR }}"
+          echo "🚀 最新 Release: ${{ steps.latest-release.outputs.tag || env.LATEST_RELEASE_TAG || '未获取' }}"
+          echo "🏷️  主标签: ${{ env.TAG_NAME }}"
+          echo "🔢 SHA: ${{ steps.git-info.outputs.sha_short }}"
+          echo "🖥️  平台: ${{ env.PLATFORMS }}"
+          echo ""
+          echo "🏷️  已推送的全部标签:"
+          echo "$PUSHED_TAGS" | sed 's/^/   /'
+          echo ""
+          echo "🐳 Docker Hub:"
+          echo "   ${{ env.DOCKERHUB_USERNAME_FINAL }}/${{ env.IMAGE_NAME }}:${{ env.TAG_NAME }}"
+          echo "   ${{ env.DOCKERHUB_USERNAME_FINAL }}/${{ env.IMAGE_NAME }}:latest"
+          echo ""
+          echo "🐙 GitHub Container Registry:"
+          echo "   ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.TAG_NAME }}"
+          echo "   ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
+          if [ "${{ env.EXPORT_TAR }}" = "true" ]; then
+            echo ""
+            echo "📦 tar 包已导出:"
+            echo "   ${{ env.IMAGE_NAME }}-${{ env.TAG_NAME }}"
+            echo "   ⏱️  保留 1 天"
+          fi
+          echo "=========================================="

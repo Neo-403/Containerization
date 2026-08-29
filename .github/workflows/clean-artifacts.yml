@@ -1,0 +1,164 @@
+# ==============================================================================
+# 工作流名称: 自动清理过期 Artifact
+# 描述: 定时删除本仓库中超过保留天数的 GitHub Actions artifact。
+#
+# 为什么要这个工作流:
+#   artifact 的 retention-days 到期后, GitHub 只是把 artifact 标记为 expired,
+#   真正的物理删除由后台批处理执行, 延迟不确定(实测可长达数周), 期间仍占用存储配额。
+#   本工作流主动调 API 删除, 不依赖 GitHub 的自动回收。
+#
+# 使用方法:
+#   1. 修改下方 env 中的 RETENTION_DAYS / DRY_RUN 等配置即可
+#   2. 首次使用建议先设 DRY_RUN: 'true' 观察日志, 确认无误后再改为 'false'
+#   3. 权限说明: GITHUB_TOKEN 默认即有 actions: write,
+#      无需额外配置 secrets, 直接在仓库 Settings → Actions → General
+#      确认 "Workflow permissions" 为 Read and write 即可
+# ==============================================================================
+name: 自动清理过期 Artifact
+
+on:
+  schedule:  # 定时触发
+    # 每天 UTC 时间 03:00 运行 (北京时间 11:00)
+    - cron: '0 3 * * *'
+  workflow_dispatch:  # 手动触发
+    inputs:  # 手动触发时可覆盖的参数
+      retention_days:  # 保留天数
+        description: '保留天数(超过则删除),留空沿用 env 配置'
+        required: false
+        default: ''
+      dry_run:  # 试运行
+        description: '仅列出待删除项,不实际删除'
+        type: boolean
+        required: false
+        default: false
+
+permissions:  # 工作流权限
+  actions: write  # 需要删除 artifact 的权限
+
+# ==============================================================================
+# 🔧 ⭐配置区域 - 在这里修改变量即可复用
+# ==============================================================================
+env:
+  # ⭐Artifact 保留天数:创建时间超过该天数的 artifact 会被删除
+  #   建议与各构建工作流中的 retention-days 保持一致或略大
+  RETENTION_DAYS: 1
+  # ⭐试运行模式:true = 只列出待删除项不实际删除;false = 真正删除
+  DRY_RUN: 'false'
+  # ⭐单轮最大删除数量(防止误删或单次运行过久)
+  MAX_DELETE: 200
+  # ⭐是否同时清理 docker/build-push-action 生成的构建记录(形如 *.dockerbuild)
+  #   这些记录由 build-push-action 自动上传,retention-days 管不到,默认走仓库的 90 天
+  #   删除后旧构建的 build summary 会失效,但不影响已推送的镜像
+  CLEAN_DOCKERBUILD: 'false'
+# ==============================================================================
+
+jobs:
+  cleanup:  # 作业名称,唯一标识
+    name: 清理过期 Artifact  # 工作流作业名称
+    runs-on: ubuntu-latest  # 运行环境
+    steps:
+      - name: 删除超过保留期限的 Artifact  # 步骤名称
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # 供 gh CLI 鉴权
+          # 生效值：手动输入 > env
+          RETENTION: ${{ github.event.inputs.retention_days }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          REPO: ${{ github.repository }}
+        run: |
+          # 确定保留天数与试运行开关
+          RETENTION="${RETENTION:-${{ env.RETENTION_DAYS }}}"
+          DRY_RUN="${{ env.DRY_RUN }}"
+          if [ -n "$INPUT_DRY_RUN" ]; then
+            DRY_RUN="$INPUT_DRY_RUN"
+          fi
+
+          echo "=========================================="
+          echo "🧹 Artifact 清理任务"
+          echo "=========================================="
+          echo "📦 仓库: ${REPO}"
+          echo "⏱️  保留天数: ${RETENTION} 天"
+          echo "🧪 试运行: ${DRY_RUN}"
+          echo "🗑️  单轮上限: ${{ env.MAX_DELETE }} 个"
+          echo "🐳 清理 dockerbuild: ${{ env.CLEAN_DOCKERBUILD }}"
+          echo "=========================================="
+
+          # 计算截止时间:早于该时间的 artifact 即为过期
+          CUTOFF=$(date -u -d "${RETENTION} days ago" +%s)
+          echo "⏰ 截止时间: $(date -u -d "@${CUTOFF}" +%Y-%m-%dT%H:%M:%SZ) (UTC)"
+          echo ""
+
+          # 分页拉取全部 artifact(每页 100 条)
+          PAGE=1
+          DELETED=0
+          FREED=0
+          SKIPPED=0
+          FAILED=0
+          TOTAL=0
+
+          while :; do
+            RESP=$(gh api "repos/${REPO}/actions/artifacts?per_page=100&page=${PAGE}" 2>/dev/null)
+            COUNT=$(echo "$RESP" | jq -r '.artifacts | length')
+            [ "$COUNT" -eq 0 ] && break
+
+            # 逐个判断:仅处理超过保留期限的,并按开关过滤 dockerbuild
+            while IFS='|' read -r AID ANAME ACREATED ASIZE; do
+              [ -z "$AID" ] && continue
+              TOTAL=$((TOTAL + 1))
+
+              # 跳过 build-push-action 的构建记录(除非显式开启)
+              case "$ANAME" in
+                *.dockerbuild)
+                  if [ "${{ env.CLEAN_DOCKERBUILD }}" != "true" ]; then
+                    SKIPPED=$((SKIPPED + 1))
+                    continue
+                  fi
+                  ;;
+              esac
+
+              CREATED_TS=$(date -u -d "$ACREATED" +%s)
+              if [ "$CREATED_TS" -ge "$CUTOFF" ]; then
+                continue  # 未超期,保留
+              fi
+
+              MB=$((ASIZE / 1048576))
+              if [ "$DELETED" -ge "${{ env.MAX_DELETE }}" ]; then
+                echo "⚠️ 已达单轮删除上限 ${{ env.MAX_DELETE }},剩余留待下一轮"
+                break 2
+              fi
+
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "🧪 [试运行] 将删除: ${ANAME} (${ACREATED}, ${MB} MB, id=${AID})"
+              else
+                if gh api -X DELETE "repos/${REPO}/actions/artifacts/${AID}" > /dev/null 2>&1; then
+                  echo "🗑️  已删除: ${ANAME} (${ACREATED}, ${MB} MB)"
+                  DELETED=$((DELETED + 1))
+                  FREED=$((FREED + MB))
+                else
+                  echo "❌ 删除失败: ${ANAME} (id=${AID})"
+                  FAILED=$((FAILED + 1))
+                fi
+              fi
+            done <<< "$(echo "$RESP" | jq -r '.artifacts[] | "\(.id)|\(.name)|\(.created_at)|\(.size_in_bytes)"')"
+
+            # 判断是否有下一页
+            TOTAL_COUNT=$(echo "$RESP" | jq -r '.total_count')
+            if [ $((PAGE * 100)) -ge "$TOTAL_COUNT" ]; then
+              break
+            fi
+            PAGE=$((PAGE + 1))
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "📊 清理结果"
+          echo "=========================================="
+          echo "🔍 扫描 artifact: ${TOTAL} 个"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "🧪 试运行模式,未做任何删除(将 env.DRY_RUN 改为 'false' 生效)"
+          else
+            echo "✅ 已删除: ${DELETED} 个"
+            echo "💾 释放空间: 约 ${FREED} MB"
+            [ "$FAILED" -gt 0 ] && echo "❌ 删除失败: ${FAILED} 个"
+          fi
+          echo "⏭️  跳过 dockerbuild: ${SKIPPED} 个"
+          echo "=========================================="
