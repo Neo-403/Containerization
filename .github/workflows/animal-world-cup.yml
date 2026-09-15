@@ -1,14 +1,9 @@
 # ==============================================================================
-# 工作流名称: 构建 animal-world-cup Docker 镜像
+# 工作流名称: 构建 Docker 镜像
 #
 # 说明:
-#   - 本工作流不依赖仓库内预置的 Docker 文件。构建所需三个文件
-#     (Dockerfile / .dockerignore / docker/start.mjs) 全部在 Actions 内
+#   - 本工作流不依赖仓库内预置的 Docker 文件。构建所需文件全部在 Actions 内
 #     临时生成 (见 "生成构建文件" 步骤)，构建结束即弃，仓库源码保持干净。
-#   - 源码来自另一个仓库 SOURCE_REPO (默认 NeoXu954/animal-world-cup)，
-#     checkout 到 src/ 子目录，构建上下文即为 src/。
-#   - 构建产物为单镜像。局域网对战依赖 WebSocket relay (script/lan-server.mjs)，
-#     由生成的 docker/start.mjs 同时拉起 Web 与 relay。
 #   - relay 的对外可达 IP 通过 LAN_PUBLIC_HOST 注入；该值在 CI 中无法确定，
 #     故镜像构建期不预设，运行时由部署方用 -e 传入 (未传则回退容器内部 IP)。
 #
@@ -31,14 +26,6 @@
 #   - WEB_PUBLIC_URL Web 对外基址(https 主地址), 用于二维码/pad 链接。
 #       例: https://域名
 #   - LAN_PUBLIC_HOST relay 回退用的对外 IP (无反代时填宿主机 LAN IP)。
-#
-# 配置方法 (Settings → Secrets and variables → Actions):
-#   - Variables (可选):
-#       SOURCE_REPO  源仓库, 默认 NeoXu954/animal-world-cup
-#       IMAGE_NAME   镜像名, 默认 animal-world-cup
-#       PLATFORMS    目标平台, 默认 linux/amd64,linux/arm64
-#   - Secrets (推送 Docker Hub 需要):
-#       DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
 # ==============================================================================
 name: 构建 animal-world-cup(动物世界杯) 镜像
 
