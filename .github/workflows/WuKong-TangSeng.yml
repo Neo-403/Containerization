@@ -36,7 +36,7 @@ env:
   DOCKERHUB_USERNAME: 918178 # 推送的Docker Hub 用户名(若secrets中有DOCKERHUB_USERNAME则会被覆盖)
   IMAGE_NAME: wukong-tangseng  # 镜像名称
   CUSTOM_TAG: latest  # 自定义标签，设为空则使用日期
-  EXPORT_TAR: true  # 是否导出tar包(true/false)
+  EXPORT_TAR: false  # 是否导出tar包(true/false)
   # ---------- Dockerfile 配置 ----------
   BASE_IMAGE: nginx:alpine  # 基础镜像
   EXPOSE_PORT: 80  # 暴露端口
