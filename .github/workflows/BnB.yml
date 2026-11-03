@@ -1,4 +1,4 @@
-name: 构建 BnB(泡泡堂) Docker镜像  # ⭐Actions名称，docker
+name: 构建 BnB(泡泡堂)_Docker镜像  # ⭐Actions名称，docker
 
 on:  # 定义触发工作流的事件
   # release:  # 当发布新的GitHub release时触发
@@ -31,7 +31,7 @@ env:
   # ---------- Git 仓库配置 ----------
   # 说明：本仓库使用 actions/checkout 检出当前代码，REPO_URL 仅作记录
   REPO_URL: https://github.com/tpoisonooo/BnB
-  REPO_BRANCH: main  # 分支或 tag，留空则使用默认分支
+  REPO_BRANCH: master  # 分支或 tag，留空则使用默认分支
   PROJECT_SUBDIR: .  # 项目子目录，留空或使用 . 表示根目录
   # ---------- 镜像配置 ----------
   DOCKERHUB_USERNAME: 918178 # 推送的Docker Hub 用户名(若secrets中有DOCKERHUB_USERNAME则会被覆盖)
