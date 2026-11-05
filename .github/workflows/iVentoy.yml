@@ -33,8 +33,8 @@ on:
         required: false
         default: false  # 默认不覆盖: 仍按镜像是否存在决定是否构建
   schedule:  # 定时触发
-    # 每天 UTC 时间 02:00 运行 (Cron 语法)
-    - cron: '0 2 * * *'
+    # 每周一 UTC 时间 02:00 运行一次 (Cron 语法: 分 时 日 月 周)
+    - cron: '0 2 * * 1'
   # workflow_run:  # 监听其他工作流完成时触发
   #   workflows: ["GoReleaser Workflow"]  # 指定工作流完成时触发
   #   types: [completed]  # 当工作流完成时触发
@@ -99,9 +99,12 @@ jobs:
       # 步骤 1: 获取最新的 Release 版本号
       - name: 获取最新的 Release Tag
         id: get_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "正在从 ${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }} 获取最新 release..."
-          LATEST_TAG=$(curl -sL https://api.github.com/repos/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/releases/latest | jq -r ".tag_name")
+          # 使用官方 gh CLI 调用已认证的 API，避免未认证限流导致获取失败
+          LATEST_TAG=$(gh api repos/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/releases/latest --jq '.tag_name')
           if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" == "null" ]; then
             echo "无法获取最新 release tag，可能是网络问题或仓库不存在。"
             exit 1
@@ -160,11 +163,13 @@ jobs:
       # 并在 Dockerfile 中使用多阶段构建自行编译。
       - name: 下载上游发布包  # 步骤名称
         id: download  # 步骤 ID(方便后面引用)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ needs.check-and-build.outputs.latest_tag }}"
 
-          # 获取该 release 的所有资产下载链接
-          ASSETS=$(curl -sL "https://api.github.com/repos/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/releases/tags/${TAG}" | jq -r '.assets[].browser_download_url')
+          # 获取该 release 的所有资产下载链接 (使用 gh CLI 已认证 API，避免未认证限流)
+          ASSETS=$(gh api repos/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/releases/tags/${TAG} --jq '.assets[].browser_download_url')
           echo "该 release 的资产列表:"
           echo "$ASSETS"
 
